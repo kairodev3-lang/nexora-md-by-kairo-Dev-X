@@ -124,15 +124,15 @@ export async function createBaileysEngine() {
         helpers: { downloadMediaMessage, normalizeMessageContent, jidNormalizedUser, logger },
         assets: { menuImage },
         onSettingChange: (key, value) => {
-          if (key === 'channelboost' && value) boost?.refresh();
+          if (key === 'channelreact' && value) boost?.refresh();
         },
       });
-      // Channel boost: coordinated reactions on the channel chosen by the owner (shared by all sessions of this process)
+      // Channel reactions: brand channel (automatic) + channels given with .channelreact (shared by all sessions of this process)
       // campaign state lives next to the sessions folders (a plain file there is ignored by the session scan)
       boost = attachChannelBoost(sock, {
-        isEnabled: () => extras.settings.channelboost,
+        isEnabled: () => extras.settings.channelreact,
         log,
-        stateFile: path.join(authDir, '..', '_channelboost.json'),
+        stateFile: path.join(authDir, '..', '_channelreact.json'),
       });
 
       let readyResolve;
@@ -191,7 +191,7 @@ export async function createBaileysEngine() {
               continue;
             }
 
-            // answer to ".channelboost": a channel link sent alone by the owner
+            // answer to ".channelreact": a channel link sent alone by the owner
             if (isOwner && /^https?:\/\/(?:www\.)?whatsapp\.com\/channel\//i.test(text) && (await extras.boostLink(text, reply))) continue;
 
             // current prefix; ".setprefix" always works (backup if the prefix is forgotten)
