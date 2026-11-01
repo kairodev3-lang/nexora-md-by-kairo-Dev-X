@@ -1,11 +1,11 @@
-// API HTTP minimale (node:http, zéro dépendance) appelée par Telebot Creator.
+// Minimal HTTP API (node:http, zero dependency) called by Telebot Creator.
 //
 //   GET  /health                public — { ok, uptime_s }
 //   POST /v1/connect            { tg_id, phone }  -> { status:'pairing', code, expires_in } | { status:'already_connected' }
 //   GET  /v1/status?tg_id=...   -> { state, phone (masqué), connected_since }
 //   POST /v1/disconnect         { tg_id }         -> { found }
 //
-// Toutes les routes /v1 exigent l'en-tête  x-api-key.
+// All /v1 routes require the x-api-key header.
 
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -21,7 +21,7 @@ function readJson(req) {
     req.on('data', (c) => {
       size += c.length;
       if (size > MAX_BODY) {
-        reject(new ApiError('TOO_LARGE', 413, 'Requête trop volumineuse.'));
+        reject(new ApiError('TOO_LARGE', 413, 'Request too large.'));
         req.pause();
         return;
       }
@@ -34,16 +34,16 @@ function readJson(req) {
         if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('not object');
         resolve(v);
       } catch {
-        reject(new ApiError('BAD_JSON', 400, 'Corps JSON invalide.'));
+        reject(new ApiError('BAD_JSON', 400, 'Invalid JSON body.'));
       }
     });
-    req.on('error', () => reject(new ApiError('BAD_REQUEST', 400, 'Requête invalide.')));
+    req.on('error', () => reject(new ApiError('BAD_REQUEST', 400, 'Invalid request.')));
   });
 }
 
 export function createHttpServer({ config, manager, logger, notifier = null, startedAt = Date.now() }) {
   const apiHash = sha(config.apiKey);
-  const connectLimiter = new RateLimiter(3, 10 * 60_000); // 3 demandes de code / 10 min / utilisateur
+  const connectLimiter = new RateLimiter(3, 10 * 60_000); // 3 code requests / 10 min / user
   const globalLimiter = new RateLimiter(300, 60_000);
 
   const authOk = (req) => {
@@ -70,18 +70,18 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
     if (req.method === 'GET' && url.pathname === '/health') {
       return send(res, 200, { ok: true, uptime_s: Math.floor((Date.now() - startedAt) / 1000) });
     }
-    if (!url.pathname.startsWith('/v1/')) throw new ApiError('NOT_FOUND', 404, 'Route inconnue.');
+    if (!url.pathname.startsWith('/v1/')) throw new ApiError('NOT_FOUND', 404, 'Unknown route.');
 
-    if (!authOk(req)) throw new ApiError('UNAUTHORIZED', 401, 'Clé API invalide.');
+    if (!authOk(req)) throw new ApiError('UNAUTHORIZED', 401, 'Invalid API key.');
     const g = globalLimiter.hit('all');
-    if (!g.ok) throw new ApiError('RATE_LIMITED', 429, 'Trop de requêtes.', { retry_after: g.retryAfterSec });
+    if (!g.ok) throw new ApiError('RATE_LIMITED', 429, 'Too many requests.', { retry_after: g.retryAfterSec });
 
     if (url.pathname === '/v1/connect') {
-      if (req.method !== 'POST') throw new ApiError('METHOD', 405, 'Méthode non autorisée.');
+      if (req.method !== 'POST') throw new ApiError('METHOD', 405, 'Method not allowed.');
       const body = await readJson(req);
       const lim = connectLimiter.hit(String(body.tg_id));
       if (!lim.ok) {
-        throw new ApiError('RATE_LIMITED', 429, `Trop de demandes de code. Réessayez dans ${Math.ceil(lim.retryAfterSec / 60)} min.`, {
+        throw new ApiError('RATE_LIMITED', 429, `Too many code requests. Try again in ${Math.ceil(lim.retryAfterSec / 60)} min.`, {
           retry_after: lim.retryAfterSec,
         });
       }
@@ -90,30 +90,30 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
       if (result.status === 'pairing' && result.code && notifier?.enabled && notifier.sendTemp) {
         const html =
           '🔐 <b>PAIRING CODE</b>\n━━━━━━━━━━━━━━━━━━━━\n\n' +
-          '<code>' + result.code + '</code>\n<i>(touchez le code pour le copier)</i>\n\n' +
-          '1️⃣ Ouvrez <b>WhatsApp</b> sur le téléphone du numéro +' + String(result.phone || '').replace('+', '') + '\n' +
-          '2️⃣ <b>Paramètres → Appareils connectés → Connecter un appareil</b>\n' +
-          '3️⃣ Choisissez <b>« Connecter avec le numéro de téléphone »</b>\n' +
-          '4️⃣ Saisissez le code ci-dessus\n\n' +
-          '⏳ Ce message se supprime automatiquement dans 10 minutes. Si WhatsApp refuse le code, relancez <code>.connect</code>.\n' +
-          '🔒 Ne partagez ce code avec personne.';
+          '<code>' + result.code + '</code>\n<i>(tap the code to copy it)</i>\n\n' +
+          '1️⃣ Open <b>WhatsApp</b> on the phone of number +' + String(result.phone || '').replace('+', '') + '\n' +
+          '2️⃣ <b>Settings → Linked devices → Link a device</b>\n' +
+          '3️⃣ Choose <b>"Link with phone number instead"</b>\n' +
+          '4️⃣ Enter the code above\n\n' +
+          '⏳ This message deletes itself in 10 minutes. If WhatsApp rejects the code, run <code>.connect</code> again.\n' +
+          '🔒 Never share this code with anyone.';
         delivered = await notifier.sendTemp(body.tg_id, html, 10 * 60_000);
       }
       return send(res, 200, { ok: true, ...result, delivered });
     }
 
     if (url.pathname === '/v1/status') {
-      if (req.method !== 'GET') throw new ApiError('METHOD', 405, 'Méthode non autorisée.');
+      if (req.method !== 'GET') throw new ApiError('METHOD', 405, 'Method not allowed.');
       return send(res, 200, { ok: true, ...manager.status(url.searchParams.get('tg_id')) });
     }
 
     if (url.pathname === '/v1/disconnect') {
-      if (req.method !== 'POST') throw new ApiError('METHOD', 405, 'Méthode non autorisée.');
+      if (req.method !== 'POST') throw new ApiError('METHOD', 405, 'Method not allowed.');
       const body = await readJson(req);
       return send(res, 200, { ok: true, ...(await manager.disconnect(body.tg_id)) });
     }
 
-    throw new ApiError('NOT_FOUND', 404, 'Route inconnue.');
+    throw new ApiError('NOT_FOUND', 404, 'Unknown route.');
   }
 
   return http.createServer(async (req, res) => {
@@ -130,10 +130,10 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
         send(res, err.status, { ok: false, error: { code: err.code, message: err.message, ...err.extra } }, headers);
       } else {
         logger.error('unhandled', { err: err?.message });
-        send(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'Erreur interne.' } });
+        send(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'Internal error.' } });
       }
     } finally {
-      // jamais de corps, de numéro, de code ni de clé dans les logs
+      // never log a body, number, code or key
       logger.info('http', { method: req.method, path: (req.url || '').split('?')[0], status, ms: Date.now() - t0 });
     }
   });
