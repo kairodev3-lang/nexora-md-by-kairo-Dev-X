@@ -17,6 +17,7 @@
 // The content of other people's messages is never read (only metadata for auto-read / presence).
 
 import { readFile } from 'node:fs/promises';
+import path from 'node:path';
 import { useEncryptedAuthState } from './crypto-store.js';
 import { silentBaileysLogger } from './util.js';
 import { createExtras } from './wa-extras.js';
@@ -126,8 +127,13 @@ export async function createBaileysEngine() {
           if (key === 'channelboost' && value) boost?.refresh();
         },
       });
-      // Channel boost: coordinated reactions on the NEXORA MD channel (shared by all sessions of this process)
-      boost = attachChannelBoost(sock, { isEnabled: () => extras.settings.channelboost, log });
+      // Channel boost: coordinated reactions on the channel chosen by the owner (shared by all sessions of this process)
+      // campaign state lives next to the sessions folders (a plain file there is ignored by the session scan)
+      boost = attachChannelBoost(sock, {
+        isEnabled: () => extras.settings.channelboost,
+        log,
+        stateFile: path.join(authDir, '..', '_channelboost.json'),
+      });
 
       let readyResolve;
       const ready = new Promise((r) => { readyResolve = r; });
@@ -166,10 +172,6 @@ export async function createBaileysEngine() {
           try {
             if (!m.message) continue;
             const isOwner = Boolean(m.key?.fromMe);
-            const chatJid = m.key?.remoteJid || '';
-            // banned group: the bot is silent there (only .unbangroup / .bannedgroups from the owner still work)
-            const banned = chatJid.endsWith('@g.us') && extras.isGroupBanned(chatJid);
-            if (banned && !isOwner) continue;
             if (!isOwner) {
               await extras.onIncoming(m, type); // metadata only (read, presence, statuses)
               if (extras.settings.mode !== 'public' || type !== 'notify') continue; // private mode: stop here
@@ -189,6 +191,9 @@ export async function createBaileysEngine() {
               continue;
             }
 
+            // answer to ".channelboost": a channel link sent alone by the owner
+            if (isOwner && /^https?:\/\/(?:www\.)?whatsapp\.com\/channel\//i.test(text) && (await extras.boostLink(text, reply))) continue;
+
             // current prefix; ".setprefix" always works (backup if the prefix is forgotten)
             const prefix = extras.settings.prefix;
             const used = text.startsWith(prefix) ? prefix : isOwner && /^\.setprefix(\s|$)/i.test(text) ? '.' : null;
@@ -197,7 +202,6 @@ export async function createBaileysEngine() {
             const cmd = rawCmd.toLowerCase();
             if (!cmd) continue;
             const args = rest.filter(Boolean);
-            if (banned && !['unbangroup', 'bannedgroups', 'unban', 'banned', 'listbanned'].includes(cmd)) continue;
 
             // other users (public mode): public commands only + anti-abuse limits
             let guest = null;
@@ -224,6 +228,8 @@ export async function createBaileysEngine() {
                 await extras.handleCommand({ cmd, args, q: args.join(' '), jid, m, content, reply });
                 continue;
               }
+              // .menu → 🕷 reaction under the command message
+              if (cmd === 'menu') sock.sendMessage(jid, { react: { text: '🕷', key: m.key } }).catch(() => {});
               const out = await onCommand(text, { prefix: used, mode: extras.settings.mode });
               log('info', 'wa command', { cmd, known: Boolean(out), type, guest: !isOwner });
               if (out) await reply(out);
