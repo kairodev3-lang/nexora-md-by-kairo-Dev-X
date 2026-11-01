@@ -20,6 +20,9 @@ const MAX_STATUS_BYTES = 64 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 const MAX_STICKERS = 100; // Telegram packs hold up to 120 stickers
 const DEFAULT_STICKERS = 20;
+const BLOCK_DEFAULT = 5;
+const BLOCK_MAX = 50;
+const BLOCK_GAP_MS = 2000; // pause between two block / unblock calls (WhatsApp rate limits)
 const TG_PROGRESS_FILE = 'tg-progress.json';
 
 export const DEFAULT_SETTINGS = Object.freeze({
@@ -33,7 +36,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   autoread: false,
   autoviewstatus: false,
   autolikestatus: false,
-  channelboost: true,
+  channelreact: true,
 });
 const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode');
 
@@ -43,7 +46,7 @@ const ALIASES = {
   acall: 'anticall',
   autoviewsview: 'autoviewstatus', avs: 'autoviewstatus', statusseen: 'autoviewstatus', astatus: 'autoviewstatus',
   als: 'autolikestatus',
-  boost: 'channelboost', chboost: 'channelboost',
+  creact: 'channelreact', chreact: 'channelreact', react: 'channelreact',
 };
 
 const INFO = {
@@ -55,7 +58,7 @@ const INFO = {
   autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
   autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
   autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
-  channelboost: { emoji: '📣', label: 'CHANNEL BOOST', desc: 'Gives your channel 10 reactions per post for 5 days; your account also reacts to other boosted channels.' },
+  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Gives your channel 10 reactions for 5 days; your account also reacts to the other channels.' },
 };
 
 const CMD_ALIASES = {
@@ -71,7 +74,7 @@ const CMD_ALIASES = {
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
-  'apk', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
+  'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
   'tiktok', 'facebook', 'instagram',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
@@ -211,6 +214,68 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       m,
       true,
     );
+  }
+
+  /* ───────── .block <times> <number> : block + unblock a number several times (default 5, max 50) ───────── */
+  // Works from ANY chat: .block 10 +50912345678 — or reply to a message / use it in the person's private chat.
+  let blockBusy = false;
+  async function blockCycles(args, { jid, content, reply }) {
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const ci0 = args.findIndex((a) => /^\d{1,3}$/.test(a)); // 1-3 digits = times
+    const numberText = args.filter((_, k) => k !== ci0).join(' '); // "+509 1234 5678" is accepted too
+    const digits = numberText.replace(/\D/g, '');
+    const phone = /^[+\d\s()-]+$/.test(numberText) && digits.length >= 8 && digits.length <= 15 ? digits : null;
+    let target = null;
+    if (phone) {
+      target = `${phone}@s.whatsapp.net`;
+      try {
+        const hit = (await sock.onWhatsApp(phone))?.[0];
+        if (hit && hit.exists === false) return reply(box('❌ BLOCK', [`+${phone} is not on WhatsApp.`]));
+        if (hit?.jid) target = hit.jid;
+      } catch {
+        /* lookup unavailable: use the number as it is */
+      }
+    } else {
+      target = ci?.participant || null; // reply to a message
+      if (!target && /@(s\.whatsapp\.net|lid)$/.test(jid)) target = jid; // private chat
+    }
+    if (!target || isSelf(target)) {
+      return reply(box('🚫 BLOCK', [
+        `Usage : *${P()}block <times> <number>*`,
+        `Example : *${P()}block 10 +50912345678*`,
+        `Times : 1 to ${BLOCK_MAX} (default ${BLOCK_DEFAULT}), e.g. 10 or 50`,
+        'Works in any chat. You can also reply to a message.',
+        'Each time = 1 block then 1 unblock. Ends unblocked.',
+      ]));
+    }
+    if (blockBusy) return reply(box('⏳ BLOCK', ['A block series is already running.']));
+    const asked = Number.parseInt(args.find((a) => /^\d{1,3}$/.test(a)) ?? '', 10); // 1-3 digits = times (a phone number has 8+)
+    const times = Math.min(BLOCK_MAX, Math.max(1, Number.isFinite(asked) ? asked : BLOCK_DEFAULT));
+    const note = asked > BLOCK_MAX ? ` (limit ${BLOCK_MAX})` : '';
+    await send(jid, { text: box('🚫 BLOCK', [`Target : @${num(target)}`, `Times : *${times}*${note}`, `Estimated : ~${Math.ceil((times * 2 * BLOCK_GAP_MS) / 1000)} s`, 'Running…']), mentions: [target] }, null);
+
+    blockBusy = true;
+    let done = 0;
+    let failed = false;
+    try {
+      for (let i = 0; i < times; i++) {
+        await sock.updateBlockStatus(target, 'block');
+        await new Promise((r) => setTimeout(r, BLOCK_GAP_MS));
+        await sock.updateBlockStatus(target, 'unblock');
+        done++;
+        if (i < times - 1) await new Promise((r) => setTimeout(r, BLOCK_GAP_MS));
+      }
+    } catch (e) {
+      failed = true;
+      log('warn', 'wa block series failed', { err: String(e?.message || 'error').slice(0, 60) });
+      await sock.updateBlockStatus(target, 'unblock').catch(() => {}); // never leave the person blocked
+    } finally {
+      blockBusy = false;
+    }
+    return send(jid, {
+      text: box(failed ? '⚠️ BLOCK' : '✅ BLOCK', [`Target : @${num(target)}`, `Done : *${done}/${times}*`, failed ? 'Stopped by an error. The person is unblocked.' : 'Finished. The person is unblocked.']),
+      mentions: [target],
+    }, null);
   }
 
   /* ───────── .unblock ───────── */
@@ -472,9 +537,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     ]));
   }
 
-  /* ───────── .channelboost [on|off|<channel link>] ───────── */
-  // Each user turns the boost ON and gives THEIR channel link: for 5 days every new post of that channel gets
-  // 10 reactions (10 different emojis) from other connected accounts that have the boost ON. The link can be changed any time.
+  /* ───────── .channelreact [on|off|<channel link>] ───────── */
+  // Each user turns it ON and gives THEIR channel link: for 5 days every connected account reacts to the new posts of
+  // that channel (10 different emojis) and to its 10 latest posts. The link can be changed any time, and redone after 5 days.
   const CHANNEL_LINK = /https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+/i;
   let awaitingLinkUntil = 0;
   const myId = () => num(sock.user?.id);
@@ -485,32 +550,32 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
 
   function boostLines() {
     const c = campaignOf(myId());
-    const lines = [`Boost : *${settings.channelboost ? 'ON' : 'OFF'}*`];
-    if (c) lines.push(`Your channel : *${c.name || '—'}*`, c.url, `Reactions : *10 per post* — ${c.emojis.join(' ')}`, `Time left : *${timeLeft(c.until - Date.now())}*`);
+    const lines = [`React : *${settings.channelreact ? 'ON' : 'OFF'}*`];
+    if (c) lines.push(`Your channel : *${c.name || '—'}*`, c.url, `Emojis : ${c.emojis.join(' ')}`, `Time left : *${timeLeft(c.until - Date.now())}*`);
     else lines.push('Your channel : *none yet*');
     return lines;
   }
 
   async function applyBoostLink(link, reply) {
-    if (!settings.channelboost) {
-      settings.channelboost = true;
+    if (!settings.channelreact) {
+      settings.channelreact = true;
       await saveSettings(authDir, settings);
     }
     awaitingLinkUntil = 0;
-    await reply(box('🔎 CHANNEL BOOST', ['Checking the channel…']));
+    await reply(box('🔎 CHANNEL REACT', ['Checking the channel…']));
     const r = await startBoost(sock, link, myId());
     if (!r.ok) {
-      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are boosted right now. Try again later.' }[r.reason];
-      return reply(box('❌ CHANNEL BOOST', [why, 'Example : https://whatsapp.com/channel/XXXX']));
+      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are running right now. Try again later.' }[r.reason];
+      return reply(box('❌ CHANNEL REACT', [why, 'Example : https://whatsapp.com/channel/XXXX']));
     }
-    try { onSettingChange('channelboost', true); } catch { /* never block a setting */ }
-    return reply(box('📣 CHANNEL BOOST ✅', [
+    try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
+    return reply(box('📣 CHANNEL REACT ✅', [
       `Channel : *${r.campaign.name || '—'}*`,
       r.campaign.url,
-      `Reactions : *10 per new post*`,
+      `Reactions : *10 per connected account*`,
       `Emojis : ${r.campaign.emojis.join(' ')}`,
       'Duration : *5 days*, then it stops by itself.',
-      `Change channel : *${P()}channelboost <new link>*`,
+      `Change channel : *${P()}channelreact <new link>*`,
     ]));
   }
 
@@ -519,27 +584,27 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (link) return applyBoostLink(link.match(CHANNEL_LINK)[0], reply);
     const v = String(args[0] || '').toLowerCase();
     if (['off', 'false', '0'].includes(v)) {
-      settings.channelboost = false;
+      settings.channelreact = false;
       await saveSettings(authDir, settings);
       stopBoost(myId());
-      try { onSettingChange('channelboost', false); } catch { /* never block a setting */ }
-      return reply(box('📣 CHANNEL BOOST', ['Boost : *OFF* ✅', 'Your account no longer reacts and your channel campaign is stopped.']));
+      try { onSettingChange('channelreact', false); } catch { /* never block a setting */ }
+      return reply(box('📣 CHANNEL REACT', ['React : *OFF* ✅', 'Your account no longer reacts and your channel campaign is stopped.']));
     }
     if (['on', 'true', '1'].includes(v) || !v) {
-      if (!settings.channelboost) {
-        settings.channelboost = true;
+      if (!settings.channelreact) {
+        settings.channelreact = true;
         await saveSettings(authDir, settings);
-        try { onSettingChange('channelboost', true); } catch { /* never block a setting */ }
+        try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
       }
       awaitingLinkUntil = Date.now() + 3 * 60_000;
       const lines = boostLines();
-      lines.push('📎 Send your channel link now.', `(or *${P()}channelboost <link>*)`, `Stop : *${P()}channelboost off*`);
-      return reply(box('📣 CHANNEL BOOST', lines));
+      lines.push('📎 Send your channel link now.', `(or *${P()}channelreact <link>*)`, `Stop : *${P()}channelreact off*`);
+      return reply(box('📣 CHANNEL REACT', lines));
     }
-    return reply(box('📣 CHANNEL BOOST', [...boostLines(), `Usage : *${P()}channelboost on* · *off* · *<channel link>*`]));
+    return reply(box('📣 CHANNEL REACT', [...boostLines(), `Usage : *${P()}channelreact on* · *off* · *<channel link>*`]));
   }
 
-  // Plain message (no prefix) right after .channelboost: a channel link sent alone is taken as the answer.
+  // Plain message (no prefix) right after .channelreact: a channel link sent alone is taken as the answer.
   async function boostLink(text, reply) {
     if (Date.now() > awaitingLinkUntil) return false;
     const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)\/?$/i);
@@ -637,6 +702,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     try {
       if (Object.hasOwn(more, name)) return await more[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'apk') return await apk(q, { reply, jid, m });
+      if (name === 'block') return await blockCycles(args, { jid, content, reply });
       if (name === 'unblock') return await unblock({ jid, content, reply });
       if (name === 'save') return await saveStatus({ jid, content, reply, requireStatus: false });
       if (name === 'setprefix') return await setPrefix(args[0], reply);
@@ -647,7 +713,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (name === 'idch') return await idCh(q, { reply });
       if (Object.hasOwn(social, name)) return await social[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'fancy') return await fancy(q, reply);
-      if (name === 'channelboost') return await channelBoostCmd(args, { reply });
+      if (name === 'channelreact') return await channelBoostCmd(args, { reply });
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
