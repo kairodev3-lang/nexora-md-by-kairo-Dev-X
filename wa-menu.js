@@ -1,6 +1,6 @@
-// Commandes WhatsApp texte (préfixe « . » par défaut, modifiable avec .setprefix).
-// Elles ne répondent QU'AUX messages écrits par le propriétaire du compte lié
-// (voir engine-baileys.js). Liste fermée : aucune commande dynamique, aucun eval.
+// WhatsApp text commands (default prefix "." — change it with .setprefix).
+// They only answer messages written by the owner of the linked account
+// (see engine-baileys.js). Closed list: no dynamic commands, no eval.
 
 export const PREFIX = '.';
 
@@ -13,18 +13,17 @@ const DEFAULT_BRAND = {
   channelLink: 'https://whatsapp.com/channel/0029VbDmi1g77qVOA4cfRq13',
 };
 
-// Source unique de la liste des commandes (menu + compteur de .alive).
+// Single source of truth for the command list (menu + .alive counter).
 export const SECTIONS = [
-  { title: '🏠 GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
-  { title: '⚡ SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
-  { title: '📥 DOWNLOAD', bullet: '⌁', cmds: ['apk', 'play', 'video', 'twitter', 'pinterest', 'telegram'] },
-  { title: '🎨 MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
-  { title: '👥 GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
-  { title: '🛠️ OWNER', bullet: '⌁', cmds: ['jid', 'unblock', 'pair', 'depair'] },
+  { icon: '🧸', title: 'Menu', cmds: ['menu', 'alive', 'runtime', 'status'] },
+  { icon: '📥', title: 'Download', cmds: ['apk', 'song', 'video', 'twitter', 'pinterest', 'telegram'] },
+  { icon: '🎨', title: 'Media', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
+  { icon: '🛠️', title: 'Tools', cmds: ['ping', 'getid', 'idch', 'pair', 'depair', 'unblock', 'owner'] },
+  { icon: '👥', title: 'Group', cmds: ['kick', 'kickall', 'tagall', 'bangroup', 'unbangroup', 'bannedgroups'] },
   {
-    title: '⚙️ SETTINGS',
-    bullet: '✧',
-    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus'],
+    icon: '⚙️',
+    title: 'Config',
+    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'channelboost'],
   },
 ];
 export const COMMAND_COUNT = SECTIONS.reduce((n, s) => n + s.cmds.length, 0);
@@ -34,10 +33,10 @@ export function fmtDuration(ms) {
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${d}j ${h}h ${m}m ${s % 60}s`;
+  return `${d}d ${h}h ${m}m ${s % 60}s`;
 }
 
-/** Texte en gras mathématique (𝐏𝐎𝐖𝐄𝐑𝐄𝐃) pour la signature. */
+/** Mathematical bold text (𝐏𝐎𝐖𝐄𝐑𝐄𝐃) for the signature. */
 export function boldUnicode(str) {
   return [...String(str)]
     .map((ch) => {
@@ -50,18 +49,7 @@ export function boldUnicode(str) {
     .join('');
 }
 
-const LINE_END = '└━━━━━━━━━━━━━━━━━━';
-
-/** Petit cadre commun à toutes les réponses : ┌─『 titre 』 │ ✧ ligne … └━━━ */
-export function box(title, lines, bullet = '✧') {
-  return [`┌─『 ${title} 』`, ...lines.map((l) => `│ ${bullet} ${l}`), LINE_END].join('\n');
-}
-
-export function signature(b = DEFAULT_BRAND) {
-  return `⟦ ${boldUnicode('POWERED BY')} ${boldUnicode(`${b.ownerName} DEV`.toUpperCase())} ⟧`;
-}
-
-/** Texte en police « machine à écrire » (𝙼𝙴𝙽𝚄) pour les titres. */
+/** Typewriter font text (𝙼𝙴𝙽𝚄). */
 export function mono(str) {
   return [...String(str)]
     .map((ch) => {
@@ -73,44 +61,70 @@ export function mono(str) {
     .join('');
 }
 
+// Never restyled: `code`, links, @mentions, commands (.song) and <placeholders> must stay typable / clickable.
+const KEEP = /`[^`]*`|https?:\/\/\S+|@\w+|(?<![\w])[.!#+\-$~^?&][A-Za-z]\w*|<[^>\n]*>/g;
+
+/** Applies the bot's writing style (typewriter font) to a sentence, leaving codes, links and commands intact. */
+export function styleText(str) {
+  const s = String(str);
+  let out = '';
+  let last = 0;
+  for (const m of s.matchAll(KEEP)) {
+    out += mono(s.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + mono(s.slice(last));
+}
+
+const RULE = '──────────────────';
+const TOP = `┌${RULE}●─○`;
+const BOTTOM = `└${RULE}●─○`;
+const SIDE = '┆';
+
+/** Plain frame used by the menu (names stay readable and copyable). */
+export function plainBox(title, lines, bullet = '⬡') {
+  return [`『 ${title} 』`, TOP, ...lines.map((l) => `${SIDE} ${bullet} ${l}`), BOTTOM].join('\n');
+}
+
+/** Frame used by every bot reply: 『 🏓 𝙿𝙸𝙽𝙶 』 ┌── ┆ ⬡ 𝚝𝚎𝚡𝚝 └── */
+export function box(title, lines, bullet = '⬡') {
+  return plainBox(styleText(String(title).replace(/\*/g, '')), lines.map(styleText), bullet);
+}
+
+export function signature(b = DEFAULT_BRAND) {
+  return `⟦ ${boldUnicode('POWERED BY')} ${boldUnicode(`${b.ownerName} DEV`.toUpperCase())} ⟧`;
+}
+
+// The menu is recognised by this prefix so the engine can attach menu.jpg to it.
+export const MENU_MARK = '『 ⚡ ';
+export const isMenuText = (t) => typeof t === 'string' && t.startsWith(MENU_MARK);
+
 const TZ = 'America/Port-au-Prince';
 
-/** Menu compact : bannière + cadre d'infos + commandes regroupées par lignes de 3. */
+/** Menu: info frame, then one frame per category with ONE command per line. */
 export function buildMenu(ctx = {}) {
   const b = { ...DEFAULT_BRAND, ...(ctx.brand || {}) };
   const P = ctx.prefix || PREFIX;
   const now = new Date(ctx.now ?? Date.now());
-  const time = new Intl.DateTimeFormat('fr-FR', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(now);
-  const date = new Intl.DateTimeFormat('fr-FR', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric' }).format(now);
+  const time = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(now);
+  const date = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric' }).format(now);
   const out = [
-    `╭━━━⟦ *${b.botName}* ⟧━━━╮`,
-    `┃ ▸ Prefix   : ${P}`,
-    `┃ ▸ Platform : ${process.env.RAILWAY_ENVIRONMENT ? 'RAILWAY' : 'SERVER'}`,
-    `┃ ▸ Commands : ${COMMAND_COUNT}`,
-    `┃ ▸ Time     : ${time}`,
-    `┃ ▸ Date     : ${date}`,
-    `┃ ▸ Owner    : ${b.ownerName}`,
-    '╰━━━━━━━━━━━━━━━━━━╯',
+    plainBox(`⚡ ${b.botName}`, [
+      `Prefix   : ${P}`,
+      `Mode     : ${String(ctx.mode || 'private').toUpperCase()}`,
+      `Platform : ${process.env.RAILWAY_ENVIRONMENT ? 'RAILWAY' : 'SERVER'}`,
+      `Commands : ${COMMAND_COUNT}`,
+      `Time     : ${time}`,
+      `Date     : ${date}`,
+      `Owner    : ${b.ownerName}`,
+    ]),
   ];
-  for (const s of SECTIONS) {
-    const [icon, ...rest] = s.title.split(' ');
-    const rows = [];
-    let cur = '';
-    for (const c of s.cmds) {
-      const item = `${s.bullet} ${P}${c}`;
-      if (cur && (cur + '  ' + item).length > 32) {
-        rows.push(cur);
-        cur = item;
-      } else cur = cur ? `${cur}  ${item}` : item;
-    }
-    if (cur) rows.push(cur);
-    out.push('', `┌─『 ${icon} ${mono(rest.join(' '))} 』`, ...rows.map((r) => `│ ${r}`), LINE_END);
-  }
+  for (const s of SECTIONS) out.push('', plainBox(`${s.icon} ${s.title}`, s.cmds.map((c) => `${P}${c}`)));
   out.push('', signature(b));
   return out.join('\n');
 }
 
-/** @returns {string|null} texte de réponse, ou null si ce n'est pas une commande connue. */
+/** @returns {string|null} reply text, or null when the command is unknown. */
 export function handleWaCommand(text, ctx = {}) {
   const P = ctx.prefix || PREFIX;
   const t = String(text || '').trim();
@@ -125,9 +139,9 @@ export function handleWaCommand(text, ctx = {}) {
     case 'help':
       return buildMenu(ctx);
     case 'ping':
-      return box('🏓 *PING*', [`Pong ! ${ctx.latencyMs != null ? `${ctx.latencyMs} ms` : '✅'}`]);
+      return box('🏓 PING', [`Pong! ${ctx.latencyMs != null ? `${ctx.latencyMs} ms` : '✅'}`]);
     case 'alive':
-      return `${box('🟢 *ALIVE*', [
+      return `${box('🟢 ALIVE', [
         `Bot      : *${b.botName}*`,
         'Status   : *Online* ✅',
         `Owner    : *${b.ownerName}*`,
@@ -136,21 +150,21 @@ export function handleWaCommand(text, ctx = {}) {
         `Uptime   : *${since(ctx.startedAt)}*`,
       ])}\n\n${signature(b)}`;
     case 'runtime':
-      return box('⏱️ *RUNTIME*', [`Service : ${since(ctx.startedAt)}`, `Session : ${since(ctx.sessionSince)}`]);
+      return box('⏱️ RUNTIME', [`Service : ${since(ctx.startedAt)}`, `Session : ${since(ctx.sessionSince)}`]);
     case 'status':
-      return box('📡 *SESSION*', ['État : 🟢 connectée', `Depuis : ${since(ctx.sessionSince)}`]);
+      return box('📡 SESSION', ['State : 🟢 connected', `Since : ${since(ctx.sessionSince)}`]);
     case 'owner':
       return box(
-        '👑 *OWNER*',
+        '👑 OWNER',
         [
           `Created by : ${b.ownerName}`,
-          `Numéro : ${b.ownerNumber}`,
+          `Number : ${b.ownerNumber}`,
           b.ownerTg ? `Telegram : ${b.ownerTg}` : null,
           b.ownerWa ? `WhatsApp : ${b.ownerWa}` : null,
-          b.channelLink ? `Chaîne : ${b.channelLink}` : null,
+          b.channelLink ? `Channel : ${b.channelLink}` : null,
         ].filter(Boolean),
       );
     default:
-      return null; // commande inconnue : silence
+      return null; // unknown command: stay silent
   }
 }
