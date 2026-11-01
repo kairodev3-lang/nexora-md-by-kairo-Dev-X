@@ -20,12 +20,12 @@ export const SECTIONS = [
   { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'telegram'] },
   { icon: '🧸', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
   { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
-  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'unblock', 'pair', 'depair'] },
+  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'pair', 'depair'] },
   {
     icon: '⚙️',
     title: 'SETTINGS',
     bullet: '✧',
-    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'channelboost'],
+    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'channelreact'],
   },
 ];
 export const COMMAND_COUNT = SECTIONS.reduce((n, s) => n + s.cmds.length, 0);
