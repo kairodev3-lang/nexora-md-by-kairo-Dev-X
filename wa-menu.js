@@ -15,14 +15,16 @@ const DEFAULT_BRAND = {
 
 // Single source of truth for the command list (menu + .alive counter).
 export const SECTIONS = [
-  { icon: '🧸', title: 'Menu', cmds: ['menu', 'alive', 'runtime', 'status'] },
-  { icon: '📥', title: 'Download', cmds: ['apk', 'song', 'video', 'twitter', 'pinterest', 'telegram'] },
-  { icon: '🎨', title: 'Media', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
-  { icon: '🛠️', title: 'Tools', cmds: ['ping', 'getid', 'idch', 'pair', 'depair', 'unblock', 'owner'] },
-  { icon: '👥', title: 'Group', cmds: ['kick', 'kickall', 'tagall', 'bangroup', 'unbangroup', 'bannedgroups'] },
+  { icon: '🏠', title: 'GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
+  { icon: '⚡', title: 'SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
+  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'song', 'video', 'twitter', 'pinterest', 'telegram'] },
+  { icon: '🎨', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
+  { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall', 'bangroup', 'unbangroup', 'bannedgroups'] },
+  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'unblock', 'pair', 'depair'] },
   {
     icon: '⚙️',
-    title: 'Config',
+    title: 'SETTINGS',
+    bullet: '✧',
     cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'channelboost'],
   },
 ];
@@ -76,18 +78,15 @@ export function styleText(str) {
   return out + mono(s.slice(last));
 }
 
-const RULE = '──────────────────';
-const TOP = `┌${RULE}●─○`;
-const BOTTOM = `└${RULE}●─○`;
-const SIDE = '┆';
+const LINE_END = '└━━━━━━━━━━━━━━━━━━';
 
-/** Plain frame used by the menu (names stay readable and copyable). */
-export function plainBox(title, lines, bullet = '⬡') {
-  return [`『 ${title} 』`, TOP, ...lines.map((l) => `${SIDE} ${bullet} ${l}`), BOTTOM].join('\n');
+/** Plain frame: ┌─『 title 』 │ ✧ line … └━━━ */
+export function plainBox(title, lines, bullet = '✧') {
+  return [`┌─『 ${title} 』`, ...lines.map((l) => `│ ${bullet} ${l}`), LINE_END].join('\n');
 }
 
-/** Frame used by every bot reply: 『 🏓 𝙿𝙸𝙽𝙶 』 ┌── ┆ ⬡ 𝚝𝚎𝚡𝚝 └── */
-export function box(title, lines, bullet = '⬡') {
+/** Frame used by every bot reply (typewriter font on the text; codes, links and commands stay intact). */
+export function box(title, lines, bullet = '✧') {
   return plainBox(styleText(String(title).replace(/\*/g, '')), lines.map(styleText), bullet);
 }
 
@@ -96,7 +95,7 @@ export function signature(b = DEFAULT_BRAND) {
 }
 
 // The menu is recognised by this prefix so the engine can attach menu.jpg to it.
-export const MENU_MARK = '『 ⚡ ';
+export const MENU_MARK = '╭━━━⟦';
 export const isMenuText = (t) => typeof t === 'string' && t.startsWith(MENU_MARK);
 
 const TZ = 'America/Port-au-Prince';
@@ -109,17 +108,17 @@ export function buildMenu(ctx = {}) {
   const time = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(now);
   const date = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric' }).format(now);
   const out = [
-    plainBox(`⚡ ${b.botName}`, [
-      `Prefix   : ${P}`,
-      `Mode     : ${String(ctx.mode || 'private').toUpperCase()}`,
-      `Platform : ${process.env.RAILWAY_ENVIRONMENT ? 'RAILWAY' : 'SERVER'}`,
-      `Commands : ${COMMAND_COUNT}`,
-      `Time     : ${time}`,
-      `Date     : ${date}`,
-      `Owner    : ${b.ownerName}`,
-    ]),
+    `╭━━━⟦ *${b.botName}* ⟧━━━╮`,
+    `┃ ▸ Prefix   : ${P}`,
+    `┃ ▸ Platform : ${process.env.RAILWAY_ENVIRONMENT ? 'RAILWAY' : 'SERVER'}`,
+    `┃ ▸ Commands : ${COMMAND_COUNT}`,
+    `┃ ▸ Time     : ${time}`,
+    `┃ ▸ Date     : ${date}`,
+    `┃ ▸ Owner    : ${b.ownerName}`,
+    '╰━━━━━━━━━━━━━━━━━━╯',
   ];
-  for (const s of SECTIONS) out.push('', plainBox(`${s.icon} ${s.title}`, s.cmds.map((c) => `${P}${c}`)));
+  // one command per line
+  for (const s of SECTIONS) out.push('', plainBox(`${s.icon} ${mono(s.title)}`, s.cmds.map((c) => `${P}${c}`), s.bullet));
   out.push('', signature(b));
   return out.join('\n');
 }
