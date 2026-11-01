@@ -1,15 +1,15 @@
-// Commandes WhatsApp qui ont besoin du socket : .apk, .unblock, .save, réglages (.autoread, …).
-// Réservées au propriétaire du compte lié : engine-baileys.js n'appelle ce module que pour les
-// messages écrits PAR le propriétaire. Les réglages sont enregistrés dans settings.json (dossier
-// de session de l'utilisateur, supprimé avec la session).
+// WhatsApp commands that need the socket: .apk, .unblock, .save, .telegram, settings (.autoread, …).
+// Reserved for the owner of the linked account: engine-baileys.js only calls this module for
+// messages written BY the owner (other people only get the public commands in public mode).
+// Settings are stored in settings.json (the user's session folder, deleted with the session).
 
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import crypto from 'node:crypto';
-import { execFile } from 'node:child_process';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
+import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
+import { channel, inviteCode, resolveChannel } from './channelBoost.js';
 export { isPublicHttps };
 
 const SETTINGS_FILE = 'settings.json';
@@ -17,12 +17,13 @@ const PREFIX_CHARS = '.!#+-$~^?&';
 const MAX_APK_BYTES = 100 * 1024 * 1024;
 const MAX_STATUS_BYTES = 64 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
-const MAX_VIDEO_SECONDS = 30 * 60;
-const MAX_STICKERS = 50;
+const MAX_STICKERS = 100; // Telegram packs hold up to 120 stickers
+const DEFAULT_STICKERS = 20;
+const MAX_BANNED_GROUPS = 200;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   prefix: '.',
-  mode: 'private', // private = seulement le propriétaire · public = les autres ont accès aux commandes publiques
+  mode: 'private', // private = owner only · public = other people can use the public commands
   autorecording: false,
   autotyping: false,
   anticall: false,
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
   autoread: false,
   autoviewstatus: false,
   autolikestatus: false,
+  channelboost: true,
 });
 const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode');
 
@@ -40,43 +42,48 @@ const ALIASES = {
   acall: 'anticall',
   autoviewsview: 'autoviewstatus', avs: 'autoviewstatus', statusseen: 'autoviewstatus', astatus: 'autoviewstatus',
   als: 'autolikestatus',
+  boost: 'channelboost', chboost: 'channelboost',
 };
 
 const INFO = {
-  autorecording: { emoji: '🎙️', label: 'AUTO RECORDING', desc: 'Affiche « enregistre un vocal… » quand on vous écrit.' },
-  autotyping: { emoji: '⌨️', label: 'AUTO TYPING', desc: 'Affiche « écrit… » quand on vous écrit.' },
-  anticall: { emoji: '📵', label: 'ANTI CALL', desc: 'Rejette automatiquement les appels reçus.' },
-  welcome: { emoji: '👋', label: 'WELCOME', desc: 'Message de bienvenue aux nouveaux membres des groupes.' },
-  goodbye: { emoji: '🚪', label: 'GOODBYE', desc: 'Message d\'au revoir quand un membre quitte un groupe.' },
-  autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marque les messages reçus comme lus (coches bleues).' },
-  autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Regarde automatiquement les statuts de vos contacts.' },
-  autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Réagit ❤️ aux statuts de vos contacts.' },
+  autorecording: { emoji: '🎙️', label: 'AUTO RECORDING', desc: 'Shows "recording audio…" when someone writes to you.' },
+  autotyping: { emoji: '⌨️', label: 'AUTO TYPING', desc: 'Shows "typing…" when someone writes to you.' },
+  anticall: { emoji: '📵', label: 'ANTI CALL', desc: 'Automatically rejects incoming calls.' },
+  welcome: { emoji: '👋', label: 'WELCOME', desc: 'Welcome message for new group members.' },
+  goodbye: { emoji: '🚪', label: 'GOODBYE', desc: 'Goodbye message when a member leaves a group.' },
+  autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
+  autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
+  autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
+  channelboost: { emoji: '📣', label: 'CHANNEL BOOST', desc: 'Follows the NEXORA MD channel and reacts to its new posts.' },
 };
 
 const CMD_ALIASES = {
   ytmp4: 'video', vdl: 'video',
   pin: 'pinterest', pindl: 'pinterest',
   tgsticker: 'telegram', tg: 'telegram',
-  chatid: 'jid', gjid: 'jid', mylid: 'jid',
+  jid: 'getid', chatid: 'getid', gjid: 'getid', mylid: 'getid',
+  channelid: 'idch', chid: 'idch',
+  banned: 'bannedgroups', listbanned: 'bannedgroups', unban: 'unbangroup',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
-  'apk', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'jid', 'fancy',
+  'apk', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
+  'bangroup', 'unbangroup', 'bannedgroups',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
-/* ───────── mode public : ce que les autres peuvent utiliser ───────── */
-// Tout le reste (réglages, unblock, save, pair, telegram, jid, mode…) reste réservé au propriétaire.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'play', 'video', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
-const HEAVY_CMDS = new Set(['apk', 'play', 'video', 'twitter', 'pinterest', 'sticker', 'tourl']);
+/* ───────── public mode: what other people may use ───────── */
+// Everything else (settings, unblock, save, pair, telegram, getid, mode, bangroup…) stays owner-only.
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
+const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'twitter', 'pinterest', 'sticker', 'tourl']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
 const GUEST_HEAVY_COOLDOWN_MS = 60_000;
 const GUEST_MAX_HEAVY_PARALLEL = 2;
 
-/* ───────── .fancy : 10 styles d'écriture ───────── */
+/* ───────── .fancy : 10 writing styles ───────── */
 const SMALL_CAPS = { a: 'ᴀ', b: 'ʙ', c: 'ᴄ', d: 'ᴅ', e: 'ᴇ', f: 'ғ', g: 'ɢ', h: 'ʜ', i: 'ɪ', j: 'ᴊ', k: 'ᴋ', l: 'ʟ', m: 'ᴍ', n: 'ɴ', o: 'ᴏ', p: 'ᴘ', q: 'ǫ', r: 'ʀ', s: 's', t: 'ᴛ', u: 'ᴜ', v: 'ᴠ', w: 'ᴡ', x: 'x', y: 'ʏ', z: 'ᴢ' };
 const alpha = (up, low, dig, over = {}) => (ch) => {
   if (over[ch]) return over[ch];
@@ -108,19 +115,19 @@ export const FANCY_STYLES = [
 ];
 export const fancyAll = (text) => FANCY_STYLES.map(([name, fn]) => [name, [...String(text)].map(fn).join('')]);
 
-/* ───────── utilitaires réseau ───────── */
-const execFileP = (cmd, args, opts = {}) =>
-  new Promise((resolve, reject) => execFile(cmd, args, { timeout: 30_000, ...opts }, (err) => (err ? reject(err) : resolve())));
-
+/* ───────── network / file helpers ───────── */
 export async function loadSettings(dir) {
-  const s = { ...DEFAULT_SETTINGS };
+  const s = { ...DEFAULT_SETTINGS, bannedGroups: [] };
   try {
     const raw = JSON.parse(await fs.readFile(path.join(dir, SETTINGS_FILE), 'utf8'));
     for (const k of BOOL_KEYS) if (typeof raw[k] === 'boolean') s[k] = raw[k];
     if (raw.mode === 'public' || raw.mode === 'private') s.mode = raw.mode;
     if (typeof raw.prefix === 'string' && raw.prefix.length === 1 && PREFIX_CHARS.includes(raw.prefix)) s.prefix = raw.prefix;
+    if (Array.isArray(raw.bannedGroups)) {
+      s.bannedGroups = [...new Set(raw.bannedGroups.filter((g) => typeof g === 'string' && /^[\w-]+@g\.us$/.test(g)))].slice(0, MAX_BANNED_GROUPS);
+    }
   } catch {
-    /* pas de fichier ou fichier illisible → valeurs par défaut */
+    /* no file or unreadable file → default values */
   }
   return s;
 }
@@ -147,41 +154,47 @@ const okAptoideUrl = (u) => {
   }
 };
 
+
+const TG_LINK = /^(?:https?:\/\/)?(?:t|telegram)\.me\/addstickers\/([A-Za-z0-9_]{1,64})\/?$/i;
+
 /**
  * @param {object} d
- * @param {any} d.sock   socket Baileys
+ * @param {any} d.sock   Baileys socket
  * @param {string} d.authDir
  * @param {(jid:string, content:object, quoted?:object, plain?:boolean)=>Promise<any>} d.send
  * @param {{downloadMediaMessage:Function, normalizeMessageContent?:Function, jidNormalizedUser:Function, logger?:any}} d.helpers
+ * @param {(key:string, value:any)=>void} [d.onSettingChange]
  */
-export async function createExtras({ sock, authDir, send, helpers, log = () => {}, fetchImpl = globalThis.fetch, assets = {} }) {
+export async function createExtras({ sock, authDir, send, helpers, log = () => {}, fetchImpl = globalThis.fetch, assets = {}, onSettingChange = () => {} }) {
   const settings = await loadSettings(authDir);
   const { downloadMediaMessage, normalizeMessageContent, jidNormalizedUser } = helpers;
   const norm = (m) => (normalizeMessageContent ? normalizeMessageContent(m) : null) || m;
   const ownJid = () => (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
   const isSelf = (j) => [num(sock.user?.id), num(sock.user?.lid)].filter(Boolean).includes(num(j));
   const P = () => settings.prefix;
+  const brandName = () => process.env.BOT_NAME || 'NEXORA MD';
+  const brandOwner = () => process.env.OWNER_NAME || 'KAIRO';
   const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
-    if (!q) return reply(box('📦 *APK DOWNLOAD*', [`Usage : *${P()}apk <nom>*`, `Exemple : *${P()}apk whatsapp*`]));
-    await reply(box('🔎 *APK*', [`Recherche de « ${q.slice(0, 60)} »…`]));
+    if (!q) return reply(box('📦 APK DOWNLOAD', [`Usage : *${P()}apk <app name>*`, `Example : *${P()}apk whatsapp*`]));
+    await reply(box('🔎 APK', [`Searching for "${q.slice(0, 60)}"…`]));
     const res = await fetchImpl(`https://ws75.aptoide.com/api/7/apps/search/query=${encodeURIComponent(q)}/limit=1`, {
       signal: AbortSignal.timeout(20_000),
     });
     if (!res.ok) throw new Error(`aptoide ${res.status}`);
     const data = await res.json();
     const app = data?.datalist?.list?.[0];
-    if (!app) return reply(box('❌ *APK*', ['Aucun résultat.']));
+    if (!app) return reply(box('❌ APK', ['No result.']));
     const url = app.file?.path || app.file?.path_alt;
     const bytes = toNum(app.size) || toNum(app.file?.filesize);
-    if (!url || !okAptoideUrl(url)) return reply(box('❌ *APK*', ['Lien de téléchargement indisponible.']));
-    if (bytes > MAX_APK_BYTES) return reply(box('❌ *APK*', [`Fichier trop gros (${(bytes / 1048576).toFixed(0)} MB, max 100 MB).`]));
+    if (!url || !okAptoideUrl(url)) return reply(box('❌ APK', ['Download link unavailable.']));
+    if (bytes > MAX_APK_BYTES) return reply(box('❌ APK', [`File too big (${(bytes / 1048576).toFixed(0)} MB, max 100 MB).`]));
 
-    const info = box('📦 *APK INFO*', [
-      `Nom     : *${String(app.name || '').toUpperCase()}*`,
-      `Taille  : *${(bytes / 1048576).toFixed(2)} MB*`,
+    const info = box('📦 APK INFO', [
+      `Name    : *${String(app.name || '').toUpperCase()}*`,
+      `Size    : *${(bytes / 1048576).toFixed(2)} MB*`,
       `Package : *${app.package || '—'}*`,
       `Version : *${app.file?.vername || '—'}*`,
     ]);
@@ -202,28 +215,28 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   /* ───────── .unblock ───────── */
   async function unblock({ jid, content, reply }) {
     const ci = content?.extendedTextMessage?.contextInfo;
-    let target = ci?.participant || null; // réponse à un message
-    if (!target && /@(s\.whatsapp\.net|lid)$/.test(jid)) target = jid; // conversation privée
+    let target = ci?.participant || null; // reply to a message
+    if (!target && /@(s\.whatsapp\.net|lid)$/.test(jid)) target = jid; // private chat
     if (!target || isSelf(target)) {
-      return reply(box('✅ *UNBLOCK*', ['Répondez au message de la personne,', 'ou envoyez la commande dans sa conversation.']));
+      return reply(box('✅ UNBLOCK', ['Reply to the person\'s message,', 'or send the command in their chat.']));
     }
     await sock.updateBlockStatus(target, 'unblock');
-    await send(jid, { text: box('✅ *UNBLOCKED*', [`@${num(target)} est débloqué.`]), mentions: [target] }, null);
+    await send(jid, { text: box('✅ UNBLOCKED', [`@${num(target)} is unblocked.`]), mentions: [target] }, null);
   }
 
-  /* ───────── .save / réponse « save » à un statut ───────── */
+  /* ───────── .save / reply "save" to a status ───────── */
   async function saveStatus({ jid, content, reply, requireStatus }) {
     const ci = content?.extendedTextMessage?.contextInfo;
     if (!ci?.quotedMessage) {
       if (requireStatus) return false;
-      await reply(box('📤 *SAVE*', [`Répondez à un statut (ou un média) avec *${P()}save*.`]));
+      await reply(box('📤 SAVE', [`Reply to a status (or a media) with *${P()}save*.`]));
       return true;
     }
     if (requireStatus && ci.remoteJid !== 'status@broadcast') return false;
 
     const q = norm(ci.quotedMessage);
     const from = ci.participant ? `@${num(ci.participant)}` : '—';
-    const caption = box('📤 *STATUS SAVED*', [`De : ${from}`]);
+    const caption = box('📤 STATUS SAVED', [`From : ${from}`]);
     const me = ownJid();
     if (!me) return true;
 
@@ -231,11 +244,11 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (!media) {
       const text = q.conversation || q.extendedTextMessage?.text;
       if (text) await send(me, { text: `${caption}\n\n${text}` }, null);
-      else await reply(box('❌ *SAVE*', ['Ce type de statut n\'est pas pris en charge.']));
+      else await reply(box('❌ SAVE', ['This status type is not supported.']));
       return true;
     }
     if (toNum(media[1].fileLength) > MAX_STATUS_BYTES) {
-      await reply(box('❌ *SAVE*', ['Média trop gros (max 64 MB).']));
+      await reply(box('❌ SAVE', ['Media too big (max 64 MB).']));
       return true;
     }
     const buf = await downloadMediaMessage(
@@ -247,7 +260,6 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     await send(me, { [media[0]]: buf, caption }, null, true);
     return true;
   }
-
 
   const react = (jid, m, emoji) => sock.sendMessage(jid, { react: { text: emoji, key: m.key } }).catch(() => {});
   const getJson = async (url, ms = 25_000) => {
@@ -267,191 +279,212 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
 
   /* ───────── .pinterest ───────── */
   async function pinterest(q, { reply, jid, m }) {
-    if (!q) return reply(box('📌 *PINTEREST*', [`Usage : *${P()}pinterest <lien>*`, 'Lien pinterest.com ou pin.it']));
+    if (!q) return reply(box('📌 PINTEREST', [`Usage : *${P()}pinterest <link>*`, 'pinterest.com or pin.it link']));
     let host = '';
     try {
       host = new URL(q.trim()).hostname.toLowerCase();
     } catch {
-      /* lien invalide */
+      /* invalid link */
     }
-    if (!/(^|\.)(pinterest\.[a-z.]+|pin\.it)$/.test(host)) return reply(box('❌ *PINTEREST*', ['Lien invalide : utilisez un lien pinterest.com ou pin.it.']));
+    if (!/(^|\.)(pinterest\.[a-z.]+|pin\.it)$/.test(host)) return reply(box('❌ PINTEREST', ['Invalid link: use a pinterest.com or pin.it link.']));
     react(jid, m, '⏳');
     const data = await getJson(`https://jawad-tech.vercel.app/download/pinterest?url=${encodeURIComponent(q.trim())}`);
     const r = data?.result;
     if (!data?.status || !r?.url || !isPublicHttps(r.url)) {
       react(jid, m, '❌');
-      return reply(box('❌ *PINTEREST*', ['Impossible de récupérer ce média.', 'Vérifiez le lien et réessayez.']));
+      return reply(box('❌ PINTEREST', ['Could not fetch this media.', 'Check the link and try again.']));
     }
-    if ((await remoteSize(r.url)) > MAX_MEDIA_BYTES) return reply(box('❌ *PINTEREST*', ['Fichier trop gros (max 100 MB).']));
+    if ((await remoteSize(r.url)) > MAX_MEDIA_BYTES) return reply(box('❌ PINTEREST', ['File too big (max 100 MB).']));
     const isVideo = r.type === 'video' || /\.mp4(\?|$)/i.test(r.url);
-    const caption = box('📌 *PINTEREST*', [`Titre : *${String(r.title || '—').slice(0, 80)}*`, `Type  : *${isVideo ? 'Vidéo' : 'Image'}*`]);
+    const caption = box('📌 PINTEREST', [`Title : *${String(r.title || '—').slice(0, 80)}*`, `Type  : *${isVideo ? 'Video' : 'Image'}*`]);
     await send(jid, isVideo ? { video: { url: r.url }, mimetype: 'video/mp4', caption } : { image: { url: r.url }, caption }, m, true);
     react(jid, m, '✅');
   }
 
-  /* ───────── .video (YouTube) ───────── */
-  async function ytVideo(q, { reply, jid, m }) {
-    if (!q) return reply(box('🎥 *VIDEO*', [`Usage : *${P()}video <nom ou lien YouTube>*`, `Exemple : *${P()}video perfect ed sheeran*`]));
-    let yts;
-    try {
-      const mod = await import('yt-search');
-      yts = mod.default || mod;
-    } catch {
-      return reply(box('❌ *VIDEO*', ['Module yt-search non installé sur le serveur.']));
-    }
-    react(jid, m, '🔍');
-    const id = q.match(/(?:youtu\.be\/|youtube\.com\/shorts\/|[?&]v=)([A-Za-z0-9_-]{11})/)?.[1];
-    let v;
-    if (id) v = await yts({ videoId: id });
-    else v = (await yts(q)).videos?.[0];
-    if (!v) return reply(box('❌ *VIDEO*', ['Aucune vidéo trouvée.']));
-    if (toNum(v.seconds) > MAX_VIDEO_SECONDS) return reply(box('❌ *VIDEO*', ['Vidéo trop longue (max 30 minutes).']));
-    const thumb = v.thumbnail || v.image;
-    const info = box('🎥 *YOUTUBE VIDEO*', [
-      `Titre  : *${String(v.title || '').slice(0, 90)}*`,
-      `Chaîne : *${v.author?.name || '—'}*`,
-      `Durée  : *${v.timestamp || '—'}*`,
-      `Vues   : *${Number(v.views || 0).toLocaleString('fr-FR')}*`,
-      'Préparation du fichier…',
-    ]);
-    if (thumb && isPublicHttps(thumb)) await send(jid, { image: { url: thumb }, caption: info }, m, true);
-    else await reply(info);
-    react(jid, m, '⏳');
-
-    let dl = null;
-    for (let i = 0; i < 3 && !dl; i++) {
-      try {
-        const d = await getJson(`https://jawad-tech.vercel.app/download/ytdl?url=${encodeURIComponent(v.url)}`, 20_000);
-        if (d?.status === true && d.result?.mp4 && isPublicHttps(d.result.mp4)) dl = d.result;
-      } catch {
-        /* nouvel essai */
-      }
-      if (!dl && i < 2) await new Promise((r) => setTimeout(r, 2000));
-    }
-    if (!dl) {
-      react(jid, m, '❌');
-      return reply(box('❌ *VIDEO*', ['Lien de téléchargement indisponible.', 'Réessayez plus tard.']));
-    }
-    if ((await remoteSize(dl.mp4)) > MAX_MEDIA_BYTES) return reply(box('❌ *VIDEO*', ['Fichier trop gros (max 100 MB).']));
-    await send(jid, { video: { url: dl.mp4 }, mimetype: 'video/mp4', caption: box('✅ *VIDEO*', [String(dl.title || v.title || '').slice(0, 90)]) }, m, true);
-    react(jid, m, '✅');
-  }
-
-  /* ───────── .telegram : pack de stickers Telegram → WhatsApp ───────── */
+  /* ───────── .telegram <link> <pack name> <amount> : Telegram sticker pack → WhatsApp stickers ───────── */
   let tgBusy = false;
   async function tgStickers(args, { reply, jid, m }) {
-    const token = process.env.TELEGRAM_BOT_TOKEN;
-    if (!token) return reply(box('❌ *STICKERS*', ['TELEGRAM_BOT_TOKEN absent côté serveur.']));
-    const pack = (args[0] || '').match(/^https:\/\/t\.me\/addstickers\/([A-Za-z0-9_]{1,64})$/i)?.[1];
-    if (!pack) return reply(box('📦 *TELEGRAM STICKERS*', [`Usage : *${P()}telegram <lien> [nom du pack]*`, 'Exemple : https://t.me/addstickers/NomDuPack Mon pack']));
-    if (tgBusy) return reply(box('⏳ *STICKERS*', ['Un pack est déjà en cours d\'envoi.']));
-    let webp;
-    try {
-      const mod = await import('node-webpmux');
-      webp = mod.default || mod;
-    } catch {
-      return reply(box('❌ *STICKERS*', ['Module node-webpmux non installé sur le serveur.']));
+    const pack = (args[0] || '').match(TG_LINK)?.[1];
+    if (!pack) {
+      return reply(box('📦 TELEGRAM STICKERS', [
+        `Usage : *${P()}telegram <link> <pack name> <amount>*`,
+        `Example : *${P()}telegram https://t.me/addstickers/PackName orange 50*`,
+        `Amount : 1 to ${MAX_STICKERS} (default ${DEFAULT_STICKERS})`,
+        'Static and video stickers are supported.',
+      ]));
     }
-    const label = args.slice(1).join(' ').trim().slice(0, 40) || 'Stickers';
-    const ffmpeg = await execFileP('ffmpeg', ['-version'], { timeout: 5000 }).then(() => true, () => false);
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) return reply(box('❌ STICKERS', ['TELEGRAM_BOT_TOKEN is missing on the server.']));
+    if (tgBusy) return reply(box('⏳ STICKERS', ['A pack is already being sent.']));
+
+    const rest = args.slice(1);
+    let want = null;
+    if (rest.length && /^\d{1,3}$/.test(rest[rest.length - 1])) want = Math.min(MAX_STICKERS, Math.max(1, Number(rest.pop())));
+    const label = rest.join(' ').trim().slice(0, 40) || brandName();
+
     tgBusy = true;
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'stk-'));
     try {
       const set = await getJson(`https://api.telegram.org/bot${token}/getStickerSet?name=${encodeURIComponent(pack)}`);
       const all = set?.result?.stickers;
-      if (!set?.ok || !Array.isArray(all) || !all.length) return reply(box('❌ *STICKERS*', ['Pack introuvable.']));
-      const list = all.slice(0, MAX_STICKERS);
-      await reply(box('📦 *TELEGRAM STICKERS*', [`Stickers : *${list.length}*${all.length > list.length ? ` (sur ${all.length}, max ${MAX_STICKERS})` : ''}`, `Pack    : *${label}*`, 'Envoi en cours…']));
+      if (!set?.ok || !Array.isArray(all) || !all.length) return reply(box('❌ STICKERS', ['Pack not found.']));
+      const list = all.slice(0, want ?? Math.min(DEFAULT_STICKERS, all.length));
+      await reply(box('📦 TELEGRAM STICKERS', [`Stickers : *${list.length}* (pack has ${all.length})`, `Pack name : *${label}*`, 'Sending…']));
+
+      let ffmpegOk = null;
       let ok = 0;
       let failed = 0;
+      let animated = 0;
       for (const [i, st] of list.entries()) {
         try {
-          if (st.is_animated) throw new Error('animated');
+          if (st.is_animated) {
+            animated++;
+            throw new Error('animated (.tgs)');
+          }
           const info = await getJson(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(st.file_id)}`);
           if (!info?.ok || !info.result?.file_path) throw new Error('getFile');
           const res = await fetchImpl(`https://api.telegram.org/file/bot${token}/${info.result.file_path}`, { signal: AbortSignal.timeout(25_000) });
           if (!res.ok) throw new Error('download');
           let buf = Buffer.from(await res.arrayBuffer());
           if (st.is_video) {
-            if (!ffmpeg) throw new Error('ffmpeg');
+            if (ffmpegOk === null) ffmpegOk = await ffmpegBin().then(() => true, () => false);
+            if (!ffmpegOk) throw new Error('ffmpeg missing');
             const inP = path.join(tmp, `${i}.webm`);
             const outP = path.join(tmp, `${i}.webp`);
             await fs.writeFile(inP, buf);
-            const vf = 'scale=512:512:force_original_aspect_ratio=decrease,fps=15,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0';
-            const enc = ['-vf', vf, '-c:v', 'libwebp', '-loop', '0', '-pix_fmt', 'yuva420p', '-quality', '70', '-an', '-t', '8', outP];
             try {
-              await execFileP('ffmpeg', ['-y', '-c:v', 'libvpx-vp9', '-i', inP, ...enc]);
+              await videoToWebp(inP, outP, { seconds: 8, inputArgs: ['-c:v', 'libvpx-vp9'] }); // keeps WebM transparency
             } catch {
-              await execFileP('ffmpeg', ['-y', '-i', inP, ...enc]);
+              await videoToWebp(inP, outP, { seconds: 8 });
             }
             buf = await fs.readFile(outP);
           }
-          const img = new webp.Image();
-          await img.load(buf);
-          const meta = { 'sticker-pack-id': crypto.randomBytes(16).toString('hex'), 'sticker-pack-name': label, emojis: st.emoji ? [st.emoji] : ['🤖'] };
-          const head = Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x41, 0x57, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00]);
-          const json = Buffer.from(JSON.stringify(meta), 'utf8');
-          const exif = Buffer.concat([head, json]);
-          exif.writeUIntLE(json.length, 14, 4);
-          img.exif = exif;
-          await send(jid, { sticker: await img.save(null) }, m, true);
+          buf = await addStickerMeta(buf, { pack: label, author: brandOwner(), emoji: st.emoji || '🤖' });
+          await send(jid, { sticker: buf }, m, true);
           ok++;
         } catch (e) {
           failed++;
-          log('warn', 'wa sticker failed', { why: String(e?.message || 'error').slice(0, 40) });
+          log('warn', 'wa sticker failed', { why: String(e?.message || 'error').slice(0, 60) });
         }
-        await new Promise((r) => setTimeout(r, 800));
+        await new Promise((r) => setTimeout(r, 900));
       }
-      await reply(box('✅ *STICKERS*', [`Envoyés : *${ok}/${list.length}*`, `Échecs  : *${failed}*`, failed ? 'Les stickers animés (.tgs) ne sont pas pris en charge.' : 'Terminé !']));
+      await reply(box(ok ? '✅ STICKERS' : '❌ STICKERS', [
+        `Sent   : *${ok}/${list.length}*`,
+        `Failed : *${failed}*`,
+        animated ? `Animated .tgs stickers cannot be converted (${animated} skipped).` : failed ? 'Some stickers could not be converted.' : 'Done!',
+      ]));
     } finally {
       tgBusy = false;
       fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
     }
   }
 
-  /* ───────── .jid ───────── */
-  async function jidInfo({ jid, content, reply }) {
+  /* ───────── .getid ───────── */
+  async function getId({ jid, content, reply }) {
     const ci = content?.extendedTextMessage?.contextInfo;
     const me = ownJid();
-    const lid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : 'non détecté';
-    if (jid.endsWith('@g.us')) return reply(box('🏠 *GROUP JID*', [`ID : \`${jid}\``]));
+    const lid = sock.user?.lid ? jidNormalizedUser(sock.user.lid) : 'not detected';
+    if (jid.endsWith('@g.us')) return reply(box('🏠 GROUP ID', [`ID : \`${jid}\``]));
     const lines = [`Chat : \`${jid}\``];
-    if (ci?.participant) lines.push(`Cible : \`${ci.participant}\``);
-    lines.push(`Moi JID : \`${me || '—'}\``, `Moi LID : \`${lid}\``);
-    return reply(box('🆔 *USER DETAILS*', lines));
+    if (ci?.participant) lines.push(`Target : \`${ci.participant}\``);
+    lines.push(`My JID : \`${me || '—'}\``, `My LID : \`${lid}\``);
+    return reply(box('🆔 USER DETAILS', lines));
+  }
+
+  /* ───────── .idch <channel link> ───────── */
+  async function idCh(q, { reply }) {
+    const url = q.trim() || channel.url;
+    const code = inviteCode(url);
+    if (!code) {
+      return reply(box('📡 CHANNEL ID', [`Usage : *${P()}idch <channel link>*`, 'Example : https://whatsapp.com/channel/XXXX', `*${P()}idch* alone shows the ${brandName()} channel.`]));
+    }
+    let meta;
+    try {
+      meta = await sock.newsletterMetadata('invite', code);
+    } catch {
+      meta = null;
+    }
+    if (!meta?.id) return reply(box('❌ CHANNEL ID', ['Channel not found.', 'Check the link and try again.']));
+    if (code === inviteCode(channel.url)) await resolveChannel(sock);
+    const followers = meta.subscribers ?? meta.thread_metadata?.subscribers_count;
+    return reply(box('📡 CHANNEL ID', [
+      `Name : *${String(meta.name || meta.thread_metadata?.name?.text || '—').slice(0, 60)}*`,
+      `ID : \`${meta.id}\``,
+      ...(followers != null ? [`Followers : *${Number(followers).toLocaleString('en-US')}*`] : []),
+    ]));
+  }
+
+  /* ───────── .bangroup / .unbangroup / .bannedgroups ───────── */
+  const isGroupBanned = (jid) => settings.bannedGroups.includes(jid);
+  async function setBan(ban, args, { jid, reply }) {
+    const arg = String(args[0] || '');
+    const target = /^[\w-]+@g\.us$/.test(arg) ? arg : jid;
+    const title = ban ? '🚫 BAN GROUP' : '✅ UNBAN GROUP';
+    if (!target.endsWith('@g.us')) {
+      return reply(box(title, [`Use *${P()}${ban ? 'bangroup' : 'unbangroup'}* inside a group,`, `or give a group ID: *${P()}${ban ? 'bangroup' : 'unbangroup'} 1203…@g.us*`, `Find IDs with *${P()}getid*`]));
+    }
+    const has = settings.bannedGroups.includes(target);
+    if (ban) {
+      if (has) return reply(box(title, ['This group is already banned.', `Unban it with *${P()}unbangroup*`]));
+      if (settings.bannedGroups.length >= MAX_BANNED_GROUPS) return reply(box('❌ BAN GROUP', [`Limit reached (${MAX_BANNED_GROUPS} groups).`]));
+      settings.bannedGroups.push(target);
+    } else {
+      if (!has) return reply(box(title, ['This group is not banned.']));
+      settings.bannedGroups = settings.bannedGroups.filter((g) => g !== target);
+    }
+    await saveSettings(authDir, settings);
+    return reply(box(title, ban
+      ? ['Group banned ✅', 'The bot is now silent there for everyone.', `Unban with *${P()}unbangroup*`]
+      : ['Group unbanned ✅', 'The bot answers there again.']));
+  }
+
+  async function bannedGroups({ reply }) {
+    const list = settings.bannedGroups;
+    if (!list.length) return reply(box('🚫 BANNED GROUPS', ['No banned group.']));
+    const lines = [];
+    for (const g of list.slice(0, 20)) {
+      let name = '';
+      try {
+        name = (await sock.groupMetadata(g))?.subject || '';
+      } catch {
+        /* the bot may have left the group */
+      }
+      lines.push(`${name ? `${name.slice(0, 30)} ` : ''}\`${g}\``);
+    }
+    if (list.length > 20) lines.push(`…and ${list.length - 20} more`);
+    return reply(box('🚫 BANNED GROUPS', [`Total : *${list.length}*`, ...lines]));
   }
 
   /* ───────── .fancy ───────── */
   async function fancy(q, reply) {
-    if (!q) return reply(box('✨ *FANCY*', [`Usage : *${P()}fancy <texte>*`, '10 styles d\'écriture.']));
+    if (!q) return reply(box('✨ FANCY', [`Usage : *${P()}fancy <text>*`, '10 writing styles.']));
     const text = q.slice(0, 120);
-    return reply(box('✨ *FANCY TEXT*', fancyAll(text).map(([name, out], i) => `${i + 1}. ${out}`)));
+    return reply(box('✨ FANCY TEXT', fancyAll(text).map(([, out], i) => `${i + 1}. ${out}`)));
   }
-
 
   /* ───────── .mode ───────── */
   async function setMode(arg, reply) {
     const v = String(arg || '').toLowerCase();
     if (v !== 'public' && v !== 'private') {
-      return reply(box('🌐 *MODE*', [
-        `Statut : *${settings.mode.toUpperCase()}*`,
-        'public  : les autres utilisent les commandes publiques',
-        'private : vous seul',
-        `Usage : *${P()}mode public* ou *${P()}mode private*`,
+      return reply(box('🌐 MODE', [
+        `Status : *${settings.mode.toUpperCase()}*`,
+        'public  : other people use the public commands',
+        'private : only you',
+        `Usage : *${P()}mode public* or *${P()}mode private*`,
       ]));
     }
     settings.mode = v;
     await saveSettings(authDir, settings);
-    return reply(box('🌐 *MODE*', [
+    return reply(box('🌐 MODE', [
       `Mode : *${v.toUpperCase()}* ✅`,
       v === 'public'
-        ? `Accessible à tous : ${[...PUBLIC_CMDS].map((c) => P() + c).join(' ')}`
-        : 'Seul le propriétaire peut utiliser le bot.',
+        ? `Open to everyone: ${[...PUBLIC_CMDS].map((c) => P() + c).join(' ')}`
+        : 'Only the owner can use the bot.',
     ]));
   }
 
-  /* ───────── contrôle d'accès des autres utilisateurs (mode public) ───────── */
-  const guests = new Map(); // expéditeur -> { times: number[], heavyAt: number, warnedAt: number }
+  /* ───────── access control for other users (public mode) ───────── */
+  const guests = new Map(); // sender -> { times: number[], heavyAt: number, warnedAt: number }
   let heavyActive = 0;
   function guestCheck(cmd, sender, now = Date.now()) {
     const name = CMD_ALIASES[cmd] || cmd;
@@ -482,29 +515,30 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return { status: 'ok', release: () => { if (!released) { released = true; heavyActive--; } } };
   }
 
-  /* ───────── réglages ───────── */
+  /* ───────── settings ───────── */
   async function toggle(key, name, arg, reply) {
     const i = INFO[key];
     const v = String(arg || '').toLowerCase();
     if (['on', 'true', '1'].includes(v)) settings[key] = true;
     else if (['off', 'false', '0'].includes(v)) settings[key] = false;
     else {
-      return reply(box(`${i.emoji} *${i.label}*`, [`Statut : *${settings[key] ? 'ON' : 'OFF'}*`, i.desc, `Usage : *${P()}${name} on* ou *off*`]));
+      return reply(box(`${i.emoji} ${i.label}`, [`Status : *${settings[key] ? 'ON' : 'OFF'}*`, i.desc, `Usage : *${P()}${name} on* or *off*`]));
     }
     await saveSettings(authDir, settings);
-    return reply(box(`${i.emoji} *${i.label}*`, [`Statut : *${settings[key] ? 'ON' : 'OFF'}* ✅`]));
+    try { onSettingChange(key, settings[key]); } catch { /* never block a setting */ }
+    return reply(box(`${i.emoji} ${i.label}`, [`Status : *${settings[key] ? 'ON' : 'OFF'}* ✅`]));
   }
 
   async function setPrefix(arg, reply) {
     if (!arg || arg.length !== 1 || !PREFIX_CHARS.includes(arg)) {
-      return reply(box('🔖 *PREFIX*', [`Actuel : *${P()}*`, `Choix : ${[...PREFIX_CHARS].join(' ')}`, `Usage : *${P()}setprefix <symbole>*`]));
+      return reply(box('🔖 PREFIX', [`Current : *${P()}*`, `Choices : ${[...PREFIX_CHARS].join(' ')}`, `Usage : *${P()}setprefix <symbol>*`]));
     }
     settings.prefix = arg;
     await saveSettings(authDir, settings);
-    return reply(box('🔖 *PREFIX*', [`Nouveau prefix : *${arg}*`, `Exemple : *${arg}menu*`, 'Secours : *.setprefix .* marche toujours.']));
+    return reply(box('🔖 PREFIX', [`New prefix : *${arg}*`, `Example : *${arg}menu*`, 'Backup : *.setprefix .* always works.']));
   }
 
-  /* ───────── points d'entrée ───────── */
+  /* ───────── entry points ───────── */
   async function handleCommand({ cmd, args, q, jid, m, content, reply }) {
     const name = CMD_ALIASES[cmd] || ALIASES[cmd] || cmd;
     try {
@@ -515,20 +549,23 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (name === 'setprefix') return await setPrefix(args[0], reply);
       if (name === 'mode') return await setMode(args[0], reply);
       if (name === 'pinterest') return await pinterest(q, { reply, jid, m });
-      if (name === 'video') return await ytVideo(q, { reply, jid, m });
       if (name === 'telegram') return await tgStickers(args, { reply, jid, m });
-      if (name === 'jid') return await jidInfo({ jid, content, reply });
+      if (name === 'getid') return await getId({ jid, content, reply });
+      if (name === 'idch') return await idCh(q, { reply });
+      if (name === 'bangroup') return await setBan(true, args, { jid, reply });
+      if (name === 'unbangroup') return await setBan(false, args, { jid, reply });
+      if (name === 'bannedgroups') return await bannedGroups({ reply });
       if (name === 'fancy') return await fancy(q, reply);
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
       react(jid, m, '❌');
-      await reply(box('⚠️ *ERREUR*', [`La commande ${P()}${name} a échoué.`, 'Réessayez dans un instant.'])).catch(() => {});
+      await reply(box('⚠️ ERROR', [`The command ${P()}${name} failed.`, 'Try again in a moment.'])).catch(() => {});
     }
     return null;
   }
 
-  // Réponse « save / send / sendme » à un statut (sans préfixe).
+  // Reply "save / send / sendme" to a status (no prefix).
   const saveFromStatus = (a) => saveStatus({ ...a, requireStatus: true });
 
   const safe = async (label, fn) => {
@@ -539,7 +576,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
   };
 
-  // Messages reçus d'AUTRES personnes : seules les métadonnées servent (jamais le contenu).
+  // Messages from OTHER people: only metadata is used (never the content).
   async function onIncoming(m, type) {
     if (type !== 'notify' || !m.key) return;
     const jid = m.key.remoteJid;
@@ -567,22 +604,23 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   }
 
   async function onGroupUpdate({ id, participants, action }) {
+    if (isGroupBanned(id)) return;
     const wanted = (action === 'add' && settings.welcome) || (action === 'remove' && settings.goodbye);
     if (!wanted) return;
-    let subject = 'ce groupe';
+    let subject = 'this group';
     try {
       subject = (await sock.groupMetadata(id))?.subject || subject;
     } catch {
-      /* on garde le texte par défaut */
+      /* keep the default text */
     }
     for (const p of participants || []) {
       const who = typeof p === 'string' ? p : p?.phoneNumber || p?.id;
       if (!who || isSelf(who)) continue;
-      const lines = action === 'add' ? [`Bienvenue @${num(who)} 🎉`, `Dans : *${subject}*`] : [`@${num(who)} a quitté le groupe.`, `Groupe : *${subject}*`];
-      const title = action === 'add' ? '👋 *WELCOME*' : '🚪 *GOODBYE*';
+      const lines = action === 'add' ? [`Welcome @${num(who)} 🎉`, `To : *${subject}*`] : [`@${num(who)} left the group.`, `Group : *${subject}*`];
+      const title = action === 'add' ? '👋 WELCOME' : '🚪 GOODBYE';
       await safe('group message', () => send(id, { text: box(title, lines), mentions: [who] }, null));
     }
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
+  return { settings, has: (cmd) => COMMANDS.has(cmd), isGroupBanned, guestCheck, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
 }
