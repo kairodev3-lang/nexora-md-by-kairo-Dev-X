@@ -4,7 +4,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { box, plainBox, styleText, COMMAND_COUNT, signature } from './wa-menu.js';
+import { box, plainBox, styleText, COMMAND_COUNT } from './wa-menu.js';
 import { ffmpegBin, imageToWebp, videoToWebp, addStickerMeta } from './media.js';
 
 export const MORE_ALIASES = {
@@ -134,8 +134,6 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
       ]),
       '',
       styleText(`> ${b.bot} is awake and ready ⚡`),
-      '',
-      signature({ ownerName: b.owner }),
     ].join('\n');
     if (assets.menuImage) await send(jid, { image: assets.menuImage, caption: text }, m, true);
     else await send(jid, text, m);
@@ -296,7 +294,7 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
           externalAdReply: { title, body: `${brand().bot} MUSIC`, ...(thumb ? { thumbnailUrl: thumb } : {}), sourceUrl: v.url, mediaType: 1, renderLargerThumbnail: true },
         },
       }, m, true);
-      await send(jid, `${box(label, [`Title    : *${title}*`, `Duration : *${v.timestamp || '—'}*`, `Bot      : *${brand().bot}*`])}\n\n${signature({ ownerName: brand().owner })}`, m, true);
+      await send(jid, box(label, [`Title    : *${title}*`, `Duration : *${v.timestamp || '—'}*`, `Bot      : *${brand().bot}*`]), m, true);
     }
     react(jid, m, '✅');
   }
@@ -419,7 +417,7 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
     for (let i = 0; i < ids.length; i += 60) {
       const part = ids.slice(i, i + 60);
       const head = i === 0 ? `${box('📢 ANNOUNCEMENT', [`Group   : ${meta.subject}`, `Members : ${ids.length}`, ...(q ? [`Message : ${q.slice(0, 200)}`] : [])])}\n\n` : '';
-      const text = `${head}${part.map((id) => `⬡ @${jnum(id)}`).join('\n')}${i + 60 >= ids.length ? `\n\n${signature({ ownerName: brand().owner })}` : ''}`;
+      const text = `${head}${part.map((id) => `⬡ @${jnum(id)}`).join('\n')}`;
       await sock.sendMessage(jid, { text, mentions: part }, i === 0 ? { quoted: m } : undefined);
       if (i + 60 < ids.length) await new Promise((r) => setTimeout(r, 1500));
     }
