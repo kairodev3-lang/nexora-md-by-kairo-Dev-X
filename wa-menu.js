@@ -17,13 +17,14 @@ const DEFAULT_BRAND = {
 export const SECTIONS = [
   { title: '🏠 GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
   { title: '⚡ SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
-  { title: '📥 DOWNLOAD', bullet: '⌁', cmds: ['apk', 'video', 'pinterest', 'telegram'] },
-  { title: '🧰 TOOLS', bullet: '✧', cmds: ['fancy', 'jid'] },
-  { title: '🛠️ OWNER TOOLS', bullet: '◈', cmds: ['unblock', 'save', 'pair', 'depair'] },
+  { title: '📥 DOWNLOAD', bullet: '⌁', cmds: ['apk', 'play', 'video', 'twitter', 'pinterest', 'telegram'] },
+  { title: '🎨 MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
+  { title: '👥 GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
+  { title: '🛠️ OWNER', bullet: '⌁', cmds: ['jid', 'unblock', 'pair', 'depair'] },
   {
     title: '⚙️ SETTINGS',
-    bullet: '⌁',
-    cmds: ['autorecording', 'autotyping', 'anticall', 'welcome', 'goodbye', 'autoread', 'autoviewstatus', 'autolikestatus', 'mode', 'setprefix'],
+    bullet: '✧',
+    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus'],
   },
 ];
 export const COMMAND_COUNT = SECTIONS.reduce((n, s) => n + s.cmds.length, 0);
@@ -60,22 +61,50 @@ export function signature(b = DEFAULT_BRAND) {
   return `⟦ ${boldUnicode('POWERED BY')} ${boldUnicode(`${b.ownerName} DEV`.toUpperCase())} ⟧`;
 }
 
+/** Texte en police « machine à écrire » (𝙼𝙴𝙽𝚄) pour les titres. */
+export function mono(str) {
+  return [...String(str)]
+    .map((ch) => {
+      const c = ch.codePointAt(0);
+      if (c >= 65 && c <= 90) return String.fromCodePoint(0x1d670 + c - 65);
+      if (c >= 97 && c <= 122) return String.fromCodePoint(0x1d68a + c - 97);
+      return ch;
+    })
+    .join('');
+}
+
+const TZ = 'America/Port-au-Prince';
+
+/** Menu compact : bannière + cadre d'infos + commandes regroupées par lignes de 3. */
 export function buildMenu(ctx = {}) {
   const b = { ...DEFAULT_BRAND, ...(ctx.brand || {}) };
   const P = ctx.prefix || PREFIX;
-  const now = ctx.now ?? Date.now();
-  const up = ctx.startedAt ? fmtDuration(now - ctx.startedAt) : '—';
+  const now = new Date(ctx.now ?? Date.now());
+  const time = new Intl.DateTimeFormat('fr-FR', { timeZone: TZ, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(now);
+  const date = new Intl.DateTimeFormat('fr-FR', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric' }).format(now);
   const out = [
     `╭━━━⟦ *${b.botName}* ⟧━━━╮`,
-    `┃ ▸ Bot      : ${b.botName}`,
-    `┃ ▸ Owner    : ${b.ownerName}`,
     `┃ ▸ Prefix   : ${P}`,
+    `┃ ▸ Platform : ${process.env.RAILWAY_ENVIRONMENT ? 'RAILWAY' : 'SERVER'}`,
     `┃ ▸ Commands : ${COMMAND_COUNT}`,
-    `┃ ▸ Runtime  : ${up}`,
+    `┃ ▸ Time     : ${time}`,
+    `┃ ▸ Date     : ${date}`,
+    `┃ ▸ Owner    : ${b.ownerName}`,
     '╰━━━━━━━━━━━━━━━━━━╯',
   ];
   for (const s of SECTIONS) {
-    out.push('', box(`*${s.title}*`, s.cmds.map((c) => `${P}${c}`), s.bullet));
+    const [icon, ...rest] = s.title.split(' ');
+    const rows = [];
+    let cur = '';
+    for (const c of s.cmds) {
+      const item = `${s.bullet} ${P}${c}`;
+      if (cur && (cur + '  ' + item).length > 32) {
+        rows.push(cur);
+        cur = item;
+      } else cur = cur ? `${cur}  ${item}` : item;
+    }
+    if (cur) rows.push(cur);
+    out.push('', `┌─『 ${icon} ${mono(rest.join(' '))} 』`, ...rows.map((r) => `│ ${r}`), LINE_END);
   }
   out.push('', signature(b));
   return out.join('\n');
