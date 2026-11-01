@@ -1,29 +1,27 @@
-// Moteur WhatsApp basé sur Baileys.
+// WhatsApp engine based on Baileys.
 //
-// Contrat attendu par SessionManager :
+// Contract expected by SessionManager:
 //   engine.open({ tgId, authDir, key, onEvent }) -> Promise<Handle>
 //   Handle = {
 //     requestPairingCode(phone): Promise<string>   // "ABCD-EFGH"
-//     logout(): Promise<void>                       // délie l'appareil côté WhatsApp
-//     sendSelf(text): Promise<void>                 // message dans le chat « Vous-même »
-//     close(): void                                 // ferme le socket, bloque toute écriture disque
+//     logout(): Promise<void>                       // unlinks the device on the WhatsApp side
+//     sendSelf(text): Promise<void>                 // message in the "You" chat
+//     isAlive(): boolean                            // websocket still open?
+//     close(): void                                 // closes the socket, blocks any disk write
 //   }
 //   onEvent({ type: 'open' })
 //   onEvent({ type: 'close', reason: 'logged_out'|'bad_session'|'forbidden'|'restart_required'|'replaced'|'other', code })
 //
-// Messages : seules les commandes ÉCRITES PAR le propriétaire du compte (fromMe) sont exécutées,
-// dans la liste fermée de wa-menu.js / wa-extras.js. Le contenu des messages des autres personnes
-// n'est jamais lu (seules des métadonnées servent aux réglages auto-read / présence).
-// (L'ancien code exécutait des commandes arbitraires, dont un `eval`, sur les comptes : supprimé.)
-//
-// ⚠️ Ce fichier n'a pas pu être exécuté contre les serveurs WhatsApp pendant sa rédaction
-// (réseau de l'environnement de build bloqué) : voir README, étape « premier test réel ».
+// Messages: only commands WRITTEN BY the account owner (fromMe) are executed, from the closed
+// list in wa-menu.js / wa-extras.js (plus the public commands when .mode public is on).
+// The content of other people's messages is never read (only metadata for auto-read / presence).
 
 import { readFile } from 'node:fs/promises';
 import { useEncryptedAuthState } from './crypto-store.js';
 import { silentBaileysLogger } from './util.js';
 import { createExtras } from './wa-extras.js';
-import { box } from './wa-menu.js';
+import { box, isMenuText } from './wa-menu.js';
+import { attachChannelBoost, channel } from './channelBoost.js';
 
 const CODE_BY_NUMBER = {
   401: 'logged_out',
@@ -51,39 +49,34 @@ export async function createBaileysEngine() {
   const logger = silentBaileysLogger();
   const log = (level, msg, extra = {}) => console.log(JSON.stringify({ t: new Date().toISOString(), level, msg, ...extra }));
 
-  // Image du menu (menu.jpg à côté des fichiers .js). Absente → menu en texte seul.
+  // Menu image (menu.jpg next to the .js files). Missing → text-only menu.
   let menuImage = null;
   try {
     menuImage = await readFile(new URL('./menu.jpg', import.meta.url));
   } catch {
-    log('warn', 'menu.jpg introuvable : menu envoyé sans image');
+    log('warn', 'menu.jpg not found: menu sent without image');
   }
-  const isMenuText = (t) => typeof t === 'string' && t.startsWith('╭━━━⟦');
 
-  // Les messages du bot apparaissent comme « transférés » depuis la chaîne WhatsApp (bouton « Voir la chaîne »).
-  const forwarded = {
+  // Bot messages show up as "forwarded" from the WhatsApp channel (the "View channel" button).
+  const forwardedCtx = () => ({
     isForwarded: true,
     forwardingScore: 999,
-    forwardedNewsletterMessageInfo: {
-      newsletterJid: process.env.CHANNEL_JID || '120363409975095814@newsletter',
-      newsletterName: process.env.CHANNEL_NAME || 'NEXORA MD',
-      serverMessageId: 143,
-    },
-  };
+    forwardedNewsletterMessageInfo: { newsletterJid: channel.jid, newsletterName: channel.name, serverMessageId: 143 },
+  });
 
-  /** content : texte (string) ou objet Baileys. plain = true → sans habillage « chaîne » (médias, fichiers). */
+  /** content: text (string) or Baileys object. plain = true → no "channel" wrapper (media, files). */
   const sendMsg = async (sock, jid, content, quoted, plain = false) => {
     const opts = quoted ? { quoted } : undefined;
     let msg = typeof content === 'string' ? { text: content } : { ...content };
     if (menuImage && typeof content === 'string' && isMenuText(content) && content.length <= 3500) {
       msg = { image: menuImage, caption: content };
     }
-    // stickers, réactions, suppressions et modifications partent tels quels ; tout le reste porte l'habillage « chaîne »
+    // stickers, reactions, deletions and edits go out as they are; everything else carries the channel wrapper
     if (plain && (msg.sticker || msg.react || msg.delete || msg.edit)) return sock.sendMessage(jid, msg, opts);
     try {
-      return await sock.sendMessage(jid, { ...msg, contextInfo: { ...(msg.contextInfo || {}), ...forwarded } }, opts);
+      return await sock.sendMessage(jid, { ...msg, contextInfo: { ...(msg.contextInfo || {}), ...forwardedCtx() } }, opts);
     } catch (e) {
-      log('warn', 'envoi avec habillage chaîne refusé, nouvel essai simple', { err: e?.message || 'error' });
+      log('warn', 'send with channel wrapper refused, retrying plain', { err: e?.message || 'error' });
       return sock.sendMessage(jid, msg, opts);
     }
   };
@@ -96,7 +89,7 @@ export async function createBaileysEngine() {
       try {
         ({ version } = await fetchLatestBaileysVersion());
       } catch {
-        /* on garde la version par défaut de la librairie */
+        /* keep the library's default version */
       }
 
       const sock = makeWASocket({
@@ -107,8 +100,13 @@ export async function createBaileysEngine() {
           creds: store.state.creds,
           keys: makeCacheableSignalKeyStore(store.state.keys, logger),
         },
-        browser: Browsers.ubuntu('Chrome'), // nom affiché dans « Appareils connectés »
+        browser: Browsers.ubuntu('Chrome'), // name shown in "Linked devices"
         markOnlineOnConnect: false,
+        // stay connected: ping WhatsApp often, give slow networks time, never hang on a query
+        keepAliveIntervalMs: 20_000,
+        connectTimeoutMs: 60_000,
+        defaultQueryTimeoutMs: 60_000,
+        retryRequestDelayMs: 500,
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         generateHighQualityLinkPreview: false,
@@ -116,6 +114,7 @@ export async function createBaileysEngine() {
       });
 
       const send = (jid, content, quoted, plain) => sendMsg(sock, jid, content, quoted, plain);
+      let boost = null;
       const extras = await createExtras({
         sock,
         authDir,
@@ -123,7 +122,12 @@ export async function createBaileysEngine() {
         log,
         helpers: { downloadMediaMessage, normalizeMessageContent, jidNormalizedUser, logger },
         assets: { menuImage },
+        onSettingChange: (key, value) => {
+          if (key === 'channelboost' && value) boost?.refresh();
+        },
       });
+      // Channel boost: coordinated reactions on the NEXORA MD channel (shared by all sessions of this process)
+      boost = attachChannelBoost(sock, { isEnabled: () => extras.settings.channelboost, log });
 
       let readyResolve;
       const ready = new Promise((r) => { readyResolve = r; });
@@ -134,7 +138,7 @@ export async function createBaileysEngine() {
 
       sock.ev.on('connection.update', (u) => {
         if (u.connection) log('info', 'wa connection', { connection: u.connection, code: u.lastDisconnect?.error?.output?.statusCode });
-        if (u.qr) readyResolve(); // le socket est prêt à demander un code de jumelage
+        if (u.qr) readyResolve(); // the socket is ready to request a pairing code
         if (u.connection === 'open') onEvent({ type: 'open' });
         if (u.connection === 'close') {
           const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -149,8 +153,8 @@ export async function createBaileysEngine() {
         extras.onGroupUpdate(u).catch(() => {});
       });
 
-      // Commandes : uniquement les messages ÉCRITS PAR le propriétaire du compte (fromMe), dans
-      // n'importe quel chat. Les réponses du bot ne commencent jamais par le préfixe → pas de boucle.
+      // Commands: only messages WRITTEN BY the account owner (fromMe), in any chat (plus public
+      // commands for other people in public mode). Bot replies never start with the prefix → no loop.
       const tsOf = (m) => {
         const t = m.messageTimestamp;
         if (t == null) return 0;
@@ -162,26 +166,30 @@ export async function createBaileysEngine() {
           try {
             if (!m.message) continue;
             const isOwner = Boolean(m.key?.fromMe);
+            const chatJid = m.key?.remoteJid || '';
+            // banned group: the bot is silent there (only .unbangroup / .bannedgroups from the owner still work)
+            const banned = chatJid.endsWith('@g.us') && extras.isGroupBanned(chatJid);
+            if (banned && !isOwner) continue;
             if (!isOwner) {
-              await extras.onIncoming(m, type); // métadonnées seulement (lu, présence, statuts)
-              if (extras.settings.mode !== 'public' || type !== 'notify') continue; // mode private : on s'arrête là
+              await extras.onIncoming(m, type); // metadata only (read, presence, statuses)
+              if (extras.settings.mode !== 'public' || type !== 'notify') continue; // private mode: stop here
             }
             const jid = m.key.remoteJid;
             if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) continue;
-            // messages synchronisés (append) : on ignore les anciens pour ne rien rejouer au redémarrage
+            // synced messages (append): ignore old ones so nothing is replayed after a restart
             if (type !== 'notify' && Date.now() / 1000 - tsOf(m) > 60) continue;
             const content = (normalizeMessageContent ? normalizeMessageContent(m.message) : null) || m.message;
             const text = String(content.conversation || content.extendedTextMessage?.text || '').trim();
             if (!text) continue;
             const reply = (c) => send(jid, c, m);
 
-            // « save » / « send » / « sendme » en réponse à un statut
+            // "save" / "send" / "sendme" as a reply to a status
             if (isOwner && ['save', 'send', 'sendme'].includes(text.toLowerCase())) {
               if (await extras.saveFromStatus({ jid, content, reply })) log('info', 'wa status save', { type });
               continue;
             }
 
-            // préfixe courant ; « .setprefix » reste toujours utilisable (secours si on oublie le préfixe)
+            // current prefix; ".setprefix" always works (backup if the prefix is forgotten)
             const prefix = extras.settings.prefix;
             const used = text.startsWith(prefix) ? prefix : isOwner && /^\.setprefix(\s|$)/i.test(text) ? '.' : null;
             if (!used) continue;
@@ -189,22 +197,23 @@ export async function createBaileysEngine() {
             const cmd = rawCmd.toLowerCase();
             if (!cmd) continue;
             const args = rest.filter(Boolean);
+            if (banned && !['unbangroup', 'bannedgroups', 'unban', 'banned', 'listbanned'].includes(cmd)) continue;
 
-            // autres utilisateurs (mode public) : commandes publiques seulement + limites anti-abus
+            // other users (public mode): public commands only + anti-abuse limits
             let guest = null;
             if (!isOwner) {
               guest = extras.guestCheck(cmd, m.key.participant || jid);
               if (guest.status === 'ignore') continue;
               if (guest.status === 'owner_only') {
-                await reply(box('🚫 *ACCÈS REFUSÉ*', ['Commande réservée au propriétaire.']));
+                await reply(box('🚫 ACCESS DENIED', ['This command is reserved for the owner.']));
                 continue;
               }
               if (guest.status === 'slow') {
-                if (guest.notify) await reply(box('⏳ *PATIENTEZ*', [`Réessayez dans ${guest.wait} s.`]));
+                if (guest.notify) await reply(box('⏳ PLEASE WAIT', [`Try again in ${guest.wait} s.`]));
                 continue;
               }
               if (guest.status === 'busy') {
-                await reply(box('⏳ *OCCUPÉ*', ['Trop de téléchargements en cours, réessayez dans un instant.']));
+                await reply(box('⏳ BUSY', ['Too many downloads in progress, try again in a moment.']));
                 continue;
               }
             }
@@ -215,14 +224,14 @@ export async function createBaileysEngine() {
                 await extras.handleCommand({ cmd, args, q: args.join(' '), jid, m, content, reply });
                 continue;
               }
-              const out = await onCommand(text, { prefix: used });
+              const out = await onCommand(text, { prefix: used, mode: extras.settings.mode });
               log('info', 'wa command', { cmd, known: Boolean(out), type, guest: !isOwner });
               if (out) await reply(out);
             } finally {
               guest?.release?.();
             }
           } catch (e) {
-            // une commande qui échoue ne doit jamais casser la session
+            // a failing command must never break the session
             log('warn', 'wa command failed', { err: e?.message || 'error' });
           }
         }
@@ -234,9 +243,16 @@ export async function createBaileysEngine() {
           const me = sock.user?.id;
           if (me) await send(jidNormalizedUser(me), text, null);
         },
+        isAlive() {
+          try {
+            return !closed && !sock.ws?.isClosed && !sock.ws?.isClosing;
+          } catch {
+            return !closed;
+          }
+        },
         async requestPairingCode(phone) {
           await Promise.race([ready, new Promise((r) => setTimeout(r, 5000))]);
-          if (sock.authState.creds.registered) throw new Error('déjà enregistré');
+          if (sock.authState.creds.registered) throw new Error('already registered');
           const raw = await sock.requestPairingCode(phone);
           return String(raw).match(/.{1,4}/g)?.join('-') ?? String(raw);
         },
@@ -246,6 +262,7 @@ export async function createBaileysEngine() {
         close() {
           if (closed) return;
           closed = true;
+          boost?.dispose();
           store.close();
           try {
             for (const ev of ['connection.update', 'creds.update', 'messages.upsert', 'call', 'group-participants.update']) {
