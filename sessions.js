@@ -17,10 +17,12 @@ import { box, buildMenu, handleWaCommand } from './wa-menu.js';
 const PHONE_RE = /^[1-9]\d{7,14}$/;
 const TG_RE = /^(?:[1-9]\d{0,14}|w[1-9]\d{7,14})$/; // « w<numéro> » = session créée depuis WhatsApp (.pair)
 const RE_PAIR_COOLDOWN_MS = 20_000;
+const WATCHDOG_MS = 60_000;
+const STUCK_MS = 3 * 60_000;
 
 export function normalizeTgId(v) {
   const s = String(v ?? '').trim();
-  if (!TG_RE.test(s)) throw new ApiError('BAD_TG_ID', 400, 'Identifiant Telegram invalide.');
+  if (!TG_RE.test(s)) throw new ApiError('BAD_TG_ID', 400, 'Invalid Telegram ID.');
   return s;
 }
 
@@ -30,7 +32,7 @@ export function normalizePhone(v) {
     throw new ApiError(
       'BAD_PHONE',
       400,
-      'Numéro invalide. Utilisez le format international sans « + » ni « 0 » initial (ex. 50937000000).',
+      'Invalid number. Use the international format without "+" or a leading "0" (e.g. 50937000000).',
     );
   }
   return s;
@@ -49,6 +51,38 @@ export class SessionManager {
     this.sessions = new Map(); // tgId -> session
     this.locks = new Map();
     this.closing = false;
+    // Watchdog: revives sessions whose socket died silently or got stuck while reconnecting.
+    this._watchdog = setInterval(() => this._watch(), WATCHDOG_MS);
+    this._watchdog.unref?.();
+  }
+
+  _watch() {
+    if (this.closing) return;
+    const now = Date.now();
+    for (const s of this.sessions.values()) {
+      if (!s.linked || s.state === 'removed' || s.state === 'pairing') continue;
+      if (s.state === 'connected') {
+        s.downSince = null;
+        if (s.handle?.isAlive && !s.handle.isAlive()) {
+          this.logger.warn('watchdog: socket dead, reconnecting', { tg: s.tgId });
+          this._revive(s);
+        }
+        continue;
+      }
+      s.downSince ??= now;
+      if (now - s.downSince > STUCK_MS) {
+        this.logger.warn('watchdog: reconnect stuck, retrying', { tg: s.tgId, state: s.state });
+        s.downSince = now;
+        this._revive(s);
+      }
+    }
+  }
+
+  _revive(s) {
+    try { s.handle?.close(); } catch { /* already closed */ }
+    s.handle = null;
+    s.gen += 1; // late events from the dead socket are ignored
+    this._scheduleReconnect(s, 1000);
   }
 
   /* ─────────────── helpers ─────────────── */
@@ -121,7 +155,7 @@ export class SessionManager {
     });
     if (s.gen !== gen || s.state === 'removed' || this.closing) {
       handle.close();
-      throw new Error('session fermée pendant l\'ouverture');
+      throw new Error('session closed while opening');
     }
     s.handle = handle;
     return handle;
@@ -135,6 +169,7 @@ export class SessionManager {
 
   _onOpen(s) {
     s.state = 'connected';
+    s.downSince = null;
     s.attempts = 0;
     s.notifiedUnstable = false;
     s.connectedAt = Date.now();
@@ -155,7 +190,7 @@ export class SessionManager {
       t.unref?.();
       this._notify(
         s.tgId,
-        '✅ <b>WhatsApp connecté</b>\nVotre session NEXORA MD est active.\nUtilisez /status pour la vérifier, /disconnect pour la supprimer.',
+        '✅ <b>WhatsApp connected</b>\nYour NEXORA MD session is active.\nUse /status to check it, /disconnect to remove it.',
       );
     }
   }
@@ -164,6 +199,9 @@ export class SessionManager {
     try { s.handle?.close(); } catch { /* déjà fermé */ }
     s.handle = null;
     if (this.closing) return;
+
+    // 500 can be a transient stream error: retry a few times before giving up on the session
+    if (e.reason === 'bad_session' && s.linked && s.attempts < 3) return this._scheduleReconnect(s);
 
     switch (e.reason) {
       case 'restart_required': {
@@ -185,9 +223,9 @@ export class SessionManager {
         const wasLinked = s.linked;
         const text =
           e.reason === 'forbidden'
-            ? '⛔ <b>WhatsApp a refusé la connexion</b> pour ce compte. La session a été supprimée.'
+            ? '⛔ <b>WhatsApp refused the connection</b> for this account. The session was removed.'
             : wasLinked
-              ? '🔌 <b>Session WhatsApp fermée</b> (appareil retiré depuis WhatsApp ou session invalide). Utilisez /connect pour la relier.'
+              ? '🔌 <b>WhatsApp session closed</b> (device removed from WhatsApp or invalid session). Use /connect to link it again.'
               : null;
         this.logger.info('session closed by whatsapp', { tg: s.tgId, reason: e.reason });
         this._remove(s, { notifyHtml: text }).catch(() => {});
@@ -196,7 +234,7 @@ export class SessionManager {
       default: {
         if (!s.linked) {
           // Le code n'a jamais été saisi : inutile de reconnecter, il faut un nouveau code.
-          const text = s.state === 'pairing' ? '⌛ Le code de jumelage a expiré. Relancez /connect pour en obtenir un nouveau.' : null;
+          const text = s.state === 'pairing' ? '⌛ The pairing code expired. Run /connect again to get a new one.' : null;
           this._remove(s, { notifyHtml: text }).catch(() => {});
           return;
         }
@@ -214,7 +252,7 @@ export class SessionManager {
       forcedDelayMs ?? Math.min(this.backoffBaseMs * 2 ** Math.min(s.attempts - 1, 10), this.backoffMaxMs);
     if (s.attempts === 6 && !s.notifiedUnstable) {
       s.notifiedUnstable = true;
-      this._notify(s.tgId, '⚠️ <b>Connexion WhatsApp instable</b> : nouvelle tentative automatique en cours.');
+      this._notify(s.tgId, '⚠️ <b>WhatsApp connection unstable</b>: retrying automatically.');
     }
     s.reconnectTimer = setTimeout(async () => {
       if (this.closing || s.state === 'removed') return;
@@ -254,7 +292,7 @@ export class SessionManager {
     const tgId = normalizeTgId(tgIdRaw);
     const phone = normalizePhone(phoneRaw);
     return this._lock(tgId, async () => {
-      if (this.closing) throw new ApiError('SHUTTING_DOWN', 503, 'Service en cours de redémarrage, réessayez dans un instant.');
+      if (this.closing) throw new ApiError('SHUTTING_DOWN', 503, 'Service is restarting, try again in a moment.');
 
       const existing = this.sessions.get(tgId);
       if (existing) {
@@ -262,21 +300,21 @@ export class SessionManager {
           if (existing.phone === phone) {
             return { status: 'already_connected', state: existing.state, phone: maskPhone(phone) };
           }
-          throw new ApiError('SESSION_EXISTS', 409, 'Vous avez déjà un numéro lié. Utilisez /disconnect avant d\'en lier un autre.');
+          throw new ApiError('SESSION_EXISTS', 409, 'You already have a linked number. Use /disconnect before linking another one.');
         }
         if (Date.now() - existing.pairingAt < RE_PAIR_COOLDOWN_MS) {
-          throw new ApiError('TOO_SOON', 429, 'Un code vient d\'être généré. Patientez quelques secondes avant d\'en redemander un.');
+          throw new ApiError('TOO_SOON', 429, 'A code was just generated. Wait a few seconds before asking for another one.');
         }
         await this._remove(existing); // code précédent abandonné → on repart de zéro
       }
 
       for (const other of this.sessions.values()) {
         if (other.tgId !== tgId && other.phone === phone) {
-          throw new ApiError('PHONE_IN_USE', 409, 'Ce numéro est déjà lié à un autre compte Telegram.');
+          throw new ApiError('PHONE_IN_USE', 409, 'This number is already linked to another Telegram account.');
         }
       }
       if (this.sessions.size >= this.config.maxSessions) {
-        throw new ApiError('CAPACITY', 503, 'Le service est complet pour le moment. Réessayez plus tard.');
+        throw new ApiError('CAPACITY', 503, 'The service is full right now. Try again later.');
       }
 
       const s = {
@@ -303,7 +341,7 @@ export class SessionManager {
         const code = await withTimeout(handle.requestPairingCode(phone), 30_000, 'pairing');
         s.pairingTimer = setTimeout(() => {
           if (!s.linked && s.state === 'pairing') {
-            this._remove(s, { notifyHtml: '⌛ Le code de jumelage a expiré. Relancez /connect pour en obtenir un nouveau.' }).catch(() => {});
+            this._remove(s, { notifyHtml: '⌛ The pairing code expired. Run /connect again to get a new one.' }).catch(() => {});
           }
         }, this.config.pairingTtlMs);
         s.pairingTimer.unref?.();
@@ -313,7 +351,7 @@ export class SessionManager {
         await this._remove(s).catch(() => {});
         if (err instanceof ApiError) throw err;
         this.logger.warn('pairing failed', { tg: tgId, err: err.message });
-        throw new ApiError('PAIRING_FAILED', 502, 'Impossible d\'obtenir un code de jumelage WhatsApp pour le moment. Vérifiez le numéro et réessayez.');
+        throw new ApiError('PAIRING_FAILED', 502, 'Could not get a WhatsApp pairing code right now. Check the number and try again.');
       }
     });
   }
@@ -323,28 +361,28 @@ export class SessionManager {
     const phone = String(rest[0] || '').replace(/\D/g, '');
     const ok = /^[1-9]\d{7,14}$/.test(phone);
     if (name === 'pair' || name === 'getpair') {
-      if (!ok) return box('🔗 *PAIR*', [`Usage : *${P}pair 509XXXXXXXX*`, 'Indicatif + numéro, sans + ni 0.']);
+      if (!ok) return box('🔗 PAIR', [`Usage : *${P}pair 509XXXXXXXX*`, 'Country code + number, without + or 0.']);
       try {
         const r = await this.connect(`w${phone}`, phone);
-        if (r.status === 'already_connected') return box('✅ *PAIR*', [`${r.phone} est déjà connecté.`]);
-        return box('🔑 *PAIRING CODE*', [
-          `Numéro : ${r.phone}`,
-          `Code   : *${r.code}*`,
-          'WhatsApp → Appareils connectés → Connecter avec le numéro de téléphone.',
-          `Expire dans ~${Math.round(r.expires_in / 60)} min. Ne le partagez pas.`,
+        if (r.status === 'already_connected') return box('✅ PAIR', [`${r.phone} is already connected.`]);
+        return box('🔑 PAIRING CODE', [
+          `Number : ${r.phone}`,
+          `Code   : \`${r.code}\``,
+          'WhatsApp → Linked devices → Link with phone number.',
+          `Expires in ~${Math.round(r.expires_in / 60)} min. Do not share it.`,
         ]);
       } catch (err) {
-        return box('❌ *PAIR*', [err instanceof ApiError ? err.message : 'Échec, réessayez dans un instant.']);
+        return box('❌ PAIR', [err instanceof ApiError ? err.message : 'Failed, try again in a moment.']);
       }
     }
-    if (!ok) return box('🔌 *DEPAIR*', [`Usage : *${P}depair 509XXXXXXXX*`, 'Retire un numéro lié avec .pair.']);
+    if (!ok) return box('🔌 DEPAIR', [`Usage : *${P}depair 509XXXXXXXX*`, 'Removes a number linked with .pair.']);
     try {
       const r = await this.disconnect(`w${phone}`);
       return r.found
-        ? box('✅ *DEPAIR*', [`+${phone.slice(0, 3)}•••${phone.slice(-2)} est déconnecté.`])
-        : box('ℹ️ *DEPAIR*', ['Aucune session liée avec .pair pour ce numéro.', 'Les sessions Telegram se retirent avec .disconnect.']);
+        ? box('✅ DEPAIR', [`+${phone.slice(0, 3)}•••${phone.slice(-2)} is disconnected.`])
+        : box('ℹ️ DEPAIR', ['No session linked with .pair for this number.', 'Telegram sessions are removed with /disconnect.']);
     } catch (err) {
-      return box('❌ *DEPAIR*', [err instanceof ApiError ? err.message : 'Échec, réessayez.']);
+      return box('❌ DEPAIR', [err instanceof ApiError ? err.message : 'Failed, try again.']);
     }
   }
 
@@ -421,6 +459,7 @@ export class SessionManager {
   /** Arrêt propre : ferme les sockets SANS déconnecter les appareils ni effacer les sessions. */
   async shutdown() {
     this.closing = true;
+    clearInterval(this._watchdog);
     for (const s of this.sessions.values()) {
       this._clearTimers(s);
       try { s.handle?.close(); } catch { /* ignore */ }
