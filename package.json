@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@whiskeysockets/baileys": "latest",
+    "axios": "^1.7.0",
     "node-webpmux": "^3.1.0",
     "ffmpeg-static": "^5.2.0"
   },
