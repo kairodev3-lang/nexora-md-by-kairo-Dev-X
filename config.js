@@ -11,11 +11,11 @@ const int = (v, d) => {
 export function loadConfig(env = process.env) {
   const apiKey = env.API_KEY || '';
   if (apiKey.length < 24) {
-    throw new Error('API_KEY manquante ou trop courte (24 caractères minimum). Générez-la avec : openssl rand -hex 24');
+    throw new Error('API_KEY missing or too short (24 characters minimum). Generate it with: openssl rand -hex 24');
   }
   const encHex = env.SESSION_ENC_KEY || '';
   if (!/^[0-9a-fA-F]{64}$/.test(encHex)) {
-    throw new Error('SESSION_ENC_KEY invalide : 64 caractères hexadécimaux requis. Générez-la avec : openssl rand -hex 32');
+    throw new Error('SESSION_ENC_KEY invalid: 64 hexadecimal characters required. Generate it with: openssl rand -hex 32');
   }
   return {
     port: int(env.PORT, 3000),
