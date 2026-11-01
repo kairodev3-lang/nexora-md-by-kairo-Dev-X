@@ -17,9 +17,9 @@ const DEFAULT_BRAND = {
 export const SECTIONS = [
   { icon: '🏠', title: 'GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
   { icon: '⚡', title: 'SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
-  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'song', 'video', 'twitter', 'pinterest', 'telegram'] },
-  { icon: '🎨', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
-  { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall', 'bangroup', 'unbangroup', 'bannedgroups'] },
+  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'telegram'] },
+  { icon: '🧸', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
+  { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
   { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'unblock', 'pair', 'depair'] },
   {
     icon: '⚙️',
@@ -78,7 +78,7 @@ export function styleText(str) {
   return out + mono(s.slice(last));
 }
 
-const LINE_END = '└━━━━━━━━━━━━━━━━━━';
+const LINE_END = '└━━━━━━━━━━━━━━━━─●─○';
 
 /** Plain frame: ┌─『 title 』 │ ✧ line … └━━━ */
 export function plainBox(title, lines, bullet = '✧') {
@@ -91,7 +91,7 @@ export function box(title, lines, bullet = '✧') {
 }
 
 export function signature(b = DEFAULT_BRAND) {
-  return `⟦ ${boldUnicode('POWERED BY')} ${boldUnicode(`${b.ownerName} DEV`.toUpperCase())} ⟧`;
+  return `*⟪ ${mono('POWERED BY')} ${mono(String(b.ownerName).toUpperCase())} 〆 ${mono('DEV')} ⟫*`;
 }
 
 // The menu is recognised by this prefix so the engine can attach menu.jpg to it.
@@ -147,7 +147,7 @@ export function handleWaCommand(text, ctx = {}) {
         `Prefix   : *${P}*`,
         `Commands : *${COMMAND_COUNT}*`,
         `Uptime   : *${since(ctx.startedAt)}*`,
-      ])}\n\n${signature(b)}`;
+      ])}`;
     case 'runtime':
       return box('⏱️ RUNTIME', [`Service : ${since(ctx.startedAt)}`, `Session : ${since(ctx.sessionSince)}`]);
     case 'status':
