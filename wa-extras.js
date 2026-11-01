@@ -9,6 +9,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { box } from './wa-menu.js';
+import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
+export { isPublicHttps };
 
 const SETTINGS_FILE = 'settings.json';
 const PREFIX_CHARS = '.!#+-$~^?&';
@@ -57,16 +59,17 @@ const CMD_ALIASES = {
   tgsticker: 'telegram', tg: 'telegram',
   chatid: 'jid', gjid: 'jid', mylid: 'jid',
   fancytext: 'fancy',
+  ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'jid', 'fancy',
-  ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
+  ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── mode public : ce que les autres peuvent utiliser ───────── */
 // Tout le reste (réglages, unblock, save, pair, telegram, jid, mode…) reste réservé au propriétaire.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'video', 'pinterest', 'fancy']);
-const HEAVY_CMDS = new Set(['apk', 'video', 'pinterest']);
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'play', 'video', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
+const HEAVY_CMDS = new Set(['apk', 'play', 'video', 'twitter', 'pinterest', 'sticker', 'tourl']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
@@ -106,22 +109,6 @@ export const FANCY_STYLES = [
 export const fancyAll = (text) => FANCY_STYLES.map(([name, fn]) => [name, [...String(text)].map(fn).join('')]);
 
 /* ───────── utilitaires réseau ───────── */
-// Les liens renvoyés par des API tierces ne sont jamais suivis s'ils pointent vers un réseau interne.
-export const isPublicHttps = (u) => {
-  try {
-    const x = new URL(u);
-    if (x.protocol !== 'https:') return false;
-    const h = x.hostname.toLowerCase();
-    if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local') || h.startsWith('[')) return false;
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) {
-      const [a, b] = h.split('.').map(Number);
-      if (a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)) return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-};
 const execFileP = (cmd, args, opts = {}) =>
   new Promise((resolve, reject) => execFile(cmd, args, { timeout: 30_000, ...opts }, (err) => (err ? reject(err) : resolve())));
 
@@ -167,13 +154,14 @@ const okAptoideUrl = (u) => {
  * @param {(jid:string, content:object, quoted?:object, plain?:boolean)=>Promise<any>} d.send
  * @param {{downloadMediaMessage:Function, normalizeMessageContent?:Function, jidNormalizedUser:Function, logger?:any}} d.helpers
  */
-export async function createExtras({ sock, authDir, send, helpers, log = () => {}, fetchImpl = globalThis.fetch }) {
+export async function createExtras({ sock, authDir, send, helpers, log = () => {}, fetchImpl = globalThis.fetch, assets = {} }) {
   const settings = await loadSettings(authDir);
   const { downloadMediaMessage, normalizeMessageContent, jidNormalizedUser } = helpers;
   const norm = (m) => (normalizeMessageContent ? normalizeMessageContent(m) : null) || m;
   const ownJid = () => (sock.user?.id ? jidNormalizedUser(sock.user.id) : null);
   const isSelf = (j) => [num(sock.user?.id), num(sock.user?.lid)].filter(Boolean).includes(num(j));
   const P = () => settings.prefix;
+  const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
@@ -520,6 +508,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   async function handleCommand({ cmd, args, q, jid, m, content, reply }) {
     const name = CMD_ALIASES[cmd] || ALIASES[cmd] || cmd;
     try {
+      if (Object.hasOwn(more, name)) return await more[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'apk') return await apk(q, { reply, jid, m });
       if (name === 'unblock') return await unblock({ jid, content, reply });
       if (name === 'save') return await saveStatus({ jid, content, reply, requireStatus: false });
