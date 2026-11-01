@@ -78,7 +78,8 @@ export async function createBaileysEngine() {
     if (menuImage && typeof content === 'string' && isMenuText(content) && content.length <= 3500) {
       msg = { image: menuImage, caption: content };
     }
-    if (plain) return sock.sendMessage(jid, msg, opts);
+    // stickers, réactions, suppressions et modifications partent tels quels ; tout le reste porte l'habillage « chaîne »
+    if (plain && (msg.sticker || msg.react || msg.delete || msg.edit)) return sock.sendMessage(jid, msg, opts);
     try {
       return await sock.sendMessage(jid, { ...msg, contextInfo: { ...(msg.contextInfo || {}), ...forwarded } }, opts);
     } catch (e) {
@@ -121,6 +122,7 @@ export async function createBaileysEngine() {
         send,
         log,
         helpers: { downloadMediaMessage, normalizeMessageContent, jidNormalizedUser, logger },
+        assets: { menuImage },
       });
 
       let readyResolve;
