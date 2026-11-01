@@ -1,4 +1,4 @@
-// WhatsApp commands that need the socket: .apk, .unblock, .save, .telegram, settings (.autoread, …).
+// WhatsApp commands that need the socket: .apk, .unblock, .save, .telegram, .tiktok, .facebook, .instagram, settings (.autoread, …).
 // Reserved for the owner of the linked account: engine-baileys.js only calls this module for
 // messages written BY the owner (other people only get the public commands in public mode).
 // Settings are stored in settings.json (the user's session folder, deleted with the session).
@@ -9,7 +9,8 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf } from './channelBoost.js';
+import { createSocial } from './dl-social.js';
 export { isPublicHttps };
 
 const SETTINGS_FILE = 'settings.json';
@@ -19,7 +20,7 @@ const MAX_STATUS_BYTES = 64 * 1024 * 1024;
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 const MAX_STICKERS = 100; // Telegram packs hold up to 120 stickers
 const DEFAULT_STICKERS = 20;
-const MAX_BANNED_GROUPS = 200;
+const TG_PROGRESS_FILE = 'tg-progress.json';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   prefix: '.',
@@ -54,7 +55,7 @@ const INFO = {
   autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
   autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
   autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
-  channelboost: { emoji: '📣', label: 'CHANNEL BOOST', desc: 'Follows the NEXORA MD channel and reacts to its new posts.' },
+  channelboost: { emoji: '📣', label: 'CHANNEL BOOST', desc: 'Gives your channel 10 reactions per post for 5 days; your account also reacts to other boosted channels.' },
 };
 
 const CMD_ALIASES = {
@@ -63,20 +64,22 @@ const CMD_ALIASES = {
   tgsticker: 'telegram', tg: 'telegram',
   jid: 'getid', chatid: 'getid', gjid: 'getid', mylid: 'getid',
   channelid: 'idch', chid: 'idch',
-  banned: 'bannedgroups', listbanned: 'bannedgroups', unban: 'unbangroup',
+  fb: 'facebook', fbdl: 'facebook',
+  ig: 'instagram', igdl: 'instagram', insta: 'instagram',
+  tt: 'tiktok', tiktokdl: 'tiktok',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
-  'bangroup', 'unbangroup', 'bannedgroups',
+  'tiktok', 'facebook', 'instagram',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── public mode: what other people may use ───────── */
-// Everything else (settings, unblock, save, pair, telegram, getid, mode, bangroup…) stays owner-only.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
-const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'twitter', 'pinterest', 'sticker', 'tourl']);
+// Everything else (settings, unblock, save, pair, telegram, getid, mode…) stays owner-only.
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
+const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'sticker', 'tourl']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
@@ -117,15 +120,12 @@ export const fancyAll = (text) => FANCY_STYLES.map(([name, fn]) => [name, [...St
 
 /* ───────── network / file helpers ───────── */
 export async function loadSettings(dir) {
-  const s = { ...DEFAULT_SETTINGS, bannedGroups: [] };
+  const s = { ...DEFAULT_SETTINGS };
   try {
     const raw = JSON.parse(await fs.readFile(path.join(dir, SETTINGS_FILE), 'utf8'));
     for (const k of BOOL_KEYS) if (typeof raw[k] === 'boolean') s[k] = raw[k];
     if (raw.mode === 'public' || raw.mode === 'private') s.mode = raw.mode;
     if (typeof raw.prefix === 'string' && raw.prefix.length === 1 && PREFIX_CHARS.includes(raw.prefix)) s.prefix = raw.prefix;
-    if (Array.isArray(raw.bannedGroups)) {
-      s.bannedGroups = [...new Set(raw.bannedGroups.filter((g) => typeof g === 'string' && /^[\w-]+@g\.us$/.test(g)))].slice(0, MAX_BANNED_GROUPS);
-    }
   } catch {
     /* no file or unreadable file → default values */
   }
@@ -175,6 +175,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   const brandName = () => process.env.BOT_NAME || 'NEXORA MD';
   const brandOwner = () => process.env.OWNER_NAME || 'KAIRO';
   const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
+  const social = createSocial({ sock, send, log });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
@@ -301,16 +302,39 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     react(jid, m, '✅');
   }
 
-  /* ───────── .telegram <link> <pack name> <amount> : Telegram sticker pack → WhatsApp stickers ───────── */
+  /* ───────── .telegram <link> <pack name> [| author] <amount> : Telegram sticker pack → WhatsApp stickers ───────── */
+  // The pack name / author shown under each sticker are chosen by the user (no fixed brand name).
+  // Progress is remembered per Telegram pack: each call sends the NEXT stickers, never the ones already sent.
   let tgBusy = false;
+  const tgProgressPath = path.join(authDir, TG_PROGRESS_FILE);
+  async function loadTgProgress() {
+    try {
+      const raw = JSON.parse(await fs.readFile(tgProgressPath, 'utf8'));
+      return raw && typeof raw === 'object' ? raw : {};
+    } catch {
+      return {};
+    }
+  }
+  async function saveTgProgress(data) {
+    const tmp = `${tgProgressPath}.${process.pid}.tmp`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(data), { mode: 0o600 });
+      await fs.rename(tmp, tgProgressPath);
+    } catch {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    }
+  }
+
   async function tgStickers(args, { reply, jid, m }) {
     const pack = (args[0] || '').match(TG_LINK)?.[1];
     if (!pack) {
       return reply(box('📦 TELEGRAM STICKERS', [
         `Usage : *${P()}telegram <link> <pack name> <amount>*`,
-        `Example : *${P()}telegram https://t.me/addstickers/PackName orange 50*`,
+        `Example : *${P()}telegram https://t.me/addstickers/PackName My Pack 20*`,
+        `Author (optional) : *${P()}telegram <link> My Pack | My Name 20*`,
+        `Next batch : send the same command again, it continues where it stopped.`,
+        `Restart : *${P()}telegram <link> reset*`,
         `Amount : 1 to ${MAX_STICKERS} (default ${DEFAULT_STICKERS})`,
-        'Static and video stickers are supported.',
       ]));
     }
     const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -318,24 +342,51 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (tgBusy) return reply(box('⏳ STICKERS', ['A pack is already being sent.']));
 
     const rest = args.slice(1);
+    const key = pack.toLowerCase();
+
+    if (rest.length === 1 && /^(reset|restart|0)$/i.test(rest[0])) {
+      const data = await loadTgProgress();
+      delete data[key];
+      await saveTgProgress(data);
+      return reply(box('🔄 STICKERS', ['Progress cleared ✅', 'The next call starts from the first sticker.']));
+    }
+
     let want = null;
     if (rest.length && /^\d{1,3}$/.test(rest[rest.length - 1])) want = Math.min(MAX_STICKERS, Math.max(1, Number(rest.pop())));
-    const label = rest.join(' ').trim().slice(0, 40) || brandName();
+    const [namePart, ...authorParts] = rest.join(' ').split('|');
+    const userLabel = namePart.trim().slice(0, 40);
+    const author = authorParts.join('|').trim().slice(0, 40);
 
     tgBusy = true;
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'stk-'));
+    let start = 0;
+    let attempted = 0;
+    let progress = {};
     try {
       const set = await getJson(`https://api.telegram.org/bot${token}/getStickerSet?name=${encodeURIComponent(pack)}`);
       const all = set?.result?.stickers;
       if (!set?.ok || !Array.isArray(all) || !all.length) return reply(box('❌ STICKERS', ['Pack not found.']));
-      const list = all.slice(0, want ?? Math.min(DEFAULT_STICKERS, all.length));
-      await reply(box('📦 TELEGRAM STICKERS', [`Stickers : *${list.length}* (pack has ${all.length})`, `Pack name : *${label}*`, 'Sending…']));
+      const label = userLabel || String(set.result.title || pack).slice(0, 40);
+
+      progress = await loadTgProgress();
+      start = Math.min(Math.max(0, Number(progress[key]) || 0), all.length);
+      if (start >= all.length) {
+        return reply(box('✅ STICKERS', [`All ${all.length} stickers of this pack were already sent.`, `Restart with *${P()}telegram ${args[0]} reset*`]));
+      }
+      const list = all.slice(start, start + (want ?? DEFAULT_STICKERS));
+      await reply(box('📦 TELEGRAM STICKERS', [
+        `Stickers : *${list.length}* (${start + 1} → ${start + list.length} of ${all.length})`,
+        `Pack name : *${label}*`,
+        ...(author ? [`Author : *${author}*`] : []),
+        'Sending…',
+      ]));
 
       let ffmpegOk = null;
       let ok = 0;
       let failed = 0;
       let animated = 0;
       for (const [i, st] of list.entries()) {
+        attempted = i + 1;
         try {
           if (st.is_animated) {
             animated++;
@@ -359,7 +410,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
             }
             buf = await fs.readFile(outP);
           }
-          buf = await addStickerMeta(buf, { pack: label, author: brandOwner(), emoji: st.emoji || '🤖' });
+          buf = await addStickerMeta(buf, { pack: label, author, emoji: st.emoji || '🤖' });
           await send(jid, { sticker: buf }, m, true);
           ok++;
         } catch (e) {
@@ -368,12 +419,19 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
         }
         await new Promise((r) => setTimeout(r, 900));
       }
+      const left = all.length - (start + attempted);
       await reply(box(ok ? '✅ STICKERS' : '❌ STICKERS', [
         `Sent   : *${ok}/${list.length}*`,
         `Failed : *${failed}*`,
         animated ? `Animated .tgs stickers cannot be converted (${animated} skipped).` : failed ? 'Some stickers could not be converted.' : 'Done!',
+        left > 0 ? `Remaining : *${left}* — send the same command again for the next ones.` : 'End of the pack 🎉',
       ]));
     } finally {
+      // remember how far we got, even if the batch was interrupted
+      if (attempted > 0) {
+        progress[key] = start + attempted;
+        await saveTgProgress(progress);
+      }
       tgBusy = false;
       fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
     }
@@ -414,45 +472,80 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     ]));
   }
 
-  /* ───────── .bangroup / .unbangroup / .bannedgroups ───────── */
-  const isGroupBanned = (jid) => settings.bannedGroups.includes(jid);
-  async function setBan(ban, args, { jid, reply }) {
-    const arg = String(args[0] || '');
-    const target = /^[\w-]+@g\.us$/.test(arg) ? arg : jid;
-    const title = ban ? '🚫 BAN GROUP' : '✅ UNBAN GROUP';
-    if (!target.endsWith('@g.us')) {
-      return reply(box(title, [`Use *${P()}${ban ? 'bangroup' : 'unbangroup'}* inside a group,`, `or give a group ID: *${P()}${ban ? 'bangroup' : 'unbangroup'} 1203…@g.us*`, `Find IDs with *${P()}getid*`]));
-    }
-    const has = settings.bannedGroups.includes(target);
-    if (ban) {
-      if (has) return reply(box(title, ['This group is already banned.', `Unban it with *${P()}unbangroup*`]));
-      if (settings.bannedGroups.length >= MAX_BANNED_GROUPS) return reply(box('❌ BAN GROUP', [`Limit reached (${MAX_BANNED_GROUPS} groups).`]));
-      settings.bannedGroups.push(target);
-    } else {
-      if (!has) return reply(box(title, ['This group is not banned.']));
-      settings.bannedGroups = settings.bannedGroups.filter((g) => g !== target);
-    }
-    await saveSettings(authDir, settings);
-    return reply(box(title, ban
-      ? ['Group banned ✅', 'The bot is now silent there for everyone.', `Unban with *${P()}unbangroup*`]
-      : ['Group unbanned ✅', 'The bot answers there again.']));
+  /* ───────── .channelboost [on|off|<channel link>] ───────── */
+  // Each user turns the boost ON and gives THEIR channel link: for 5 days every new post of that channel gets
+  // 10 reactions (10 different emojis) from other connected accounts that have the boost ON. The link can be changed any time.
+  const CHANNEL_LINK = /https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+/i;
+  let awaitingLinkUntil = 0;
+  const myId = () => num(sock.user?.id);
+  const timeLeft = (ms) => {
+    const h = Math.max(0, Math.floor(ms / 3_600_000));
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
+  };
+
+  function boostLines() {
+    const c = campaignOf(myId());
+    const lines = [`Boost : *${settings.channelboost ? 'ON' : 'OFF'}*`];
+    if (c) lines.push(`Your channel : *${c.name || '—'}*`, c.url, `Reactions : *10 per post* — ${c.emojis.join(' ')}`, `Time left : *${timeLeft(c.until - Date.now())}*`);
+    else lines.push('Your channel : *none yet*');
+    return lines;
   }
 
-  async function bannedGroups({ reply }) {
-    const list = settings.bannedGroups;
-    if (!list.length) return reply(box('🚫 BANNED GROUPS', ['No banned group.']));
-    const lines = [];
-    for (const g of list.slice(0, 20)) {
-      let name = '';
-      try {
-        name = (await sock.groupMetadata(g))?.subject || '';
-      } catch {
-        /* the bot may have left the group */
-      }
-      lines.push(`${name ? `${name.slice(0, 30)} ` : ''}\`${g}\``);
+  async function applyBoostLink(link, reply) {
+    if (!settings.channelboost) {
+      settings.channelboost = true;
+      await saveSettings(authDir, settings);
     }
-    if (list.length > 20) lines.push(`…and ${list.length - 20} more`);
-    return reply(box('🚫 BANNED GROUPS', [`Total : *${list.length}*`, ...lines]));
+    awaitingLinkUntil = 0;
+    await reply(box('🔎 CHANNEL BOOST', ['Checking the channel…']));
+    const r = await startBoost(sock, link, myId());
+    if (!r.ok) {
+      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are boosted right now. Try again later.' }[r.reason];
+      return reply(box('❌ CHANNEL BOOST', [why, 'Example : https://whatsapp.com/channel/XXXX']));
+    }
+    try { onSettingChange('channelboost', true); } catch { /* never block a setting */ }
+    return reply(box('📣 CHANNEL BOOST ✅', [
+      `Channel : *${r.campaign.name || '—'}*`,
+      r.campaign.url,
+      `Reactions : *10 per new post*`,
+      `Emojis : ${r.campaign.emojis.join(' ')}`,
+      'Duration : *5 days*, then it stops by itself.',
+      `Change channel : *${P()}channelboost <new link>*`,
+    ]));
+  }
+
+  async function channelBoostCmd(args, { reply }) {
+    const link = args.find((a) => CHANNEL_LINK.test(a));
+    if (link) return applyBoostLink(link.match(CHANNEL_LINK)[0], reply);
+    const v = String(args[0] || '').toLowerCase();
+    if (['off', 'false', '0'].includes(v)) {
+      settings.channelboost = false;
+      await saveSettings(authDir, settings);
+      stopBoost(myId());
+      try { onSettingChange('channelboost', false); } catch { /* never block a setting */ }
+      return reply(box('📣 CHANNEL BOOST', ['Boost : *OFF* ✅', 'Your account no longer reacts and your channel campaign is stopped.']));
+    }
+    if (['on', 'true', '1'].includes(v) || !v) {
+      if (!settings.channelboost) {
+        settings.channelboost = true;
+        await saveSettings(authDir, settings);
+        try { onSettingChange('channelboost', true); } catch { /* never block a setting */ }
+      }
+      awaitingLinkUntil = Date.now() + 3 * 60_000;
+      const lines = boostLines();
+      lines.push('📎 Send your channel link now.', `(or *${P()}channelboost <link>*)`, `Stop : *${P()}channelboost off*`);
+      return reply(box('📣 CHANNEL BOOST', lines));
+    }
+    return reply(box('📣 CHANNEL BOOST', [...boostLines(), `Usage : *${P()}channelboost on* · *off* · *<channel link>*`]));
+  }
+
+  // Plain message (no prefix) right after .channelboost: a channel link sent alone is taken as the answer.
+  async function boostLink(text, reply) {
+    if (Date.now() > awaitingLinkUntil) return false;
+    const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)\/?$/i);
+    if (!hit) return false;
+    await applyBoostLink(hit[1], reply);
+    return true;
   }
 
   /* ───────── .fancy ───────── */
@@ -552,10 +645,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (name === 'telegram') return await tgStickers(args, { reply, jid, m });
       if (name === 'getid') return await getId({ jid, content, reply });
       if (name === 'idch') return await idCh(q, { reply });
-      if (name === 'bangroup') return await setBan(true, args, { jid, reply });
-      if (name === 'unbangroup') return await setBan(false, args, { jid, reply });
-      if (name === 'bannedgroups') return await bannedGroups({ reply });
+      if (Object.hasOwn(social, name)) return await social[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'fancy') return await fancy(q, reply);
+      if (name === 'channelboost') return await channelBoostCmd(args, { reply });
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
@@ -604,7 +696,6 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   }
 
   async function onGroupUpdate({ id, participants, action }) {
-    if (isGroupBanned(id)) return;
     const wanted = (action === 'add' && settings.welcome) || (action === 'remove' && settings.goodbye);
     if (!wanted) return;
     let subject = 'this group';
@@ -622,5 +713,5 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), isGroupBanned, guestCheck, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
+  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
 }
