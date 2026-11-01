@@ -1,14 +1,20 @@
-// channelBoost.js — every user can get reactions on their own WhatsApp channel.
+// channelBoost.js — two automatic reaction systems (no command to turn them on):
 //
-// A user turns .channelboost ON and gives their channel link. For 5 days, each new post of that channel
-// receives 10 reactions (10 different emojis) from 10 other connected sessions that have the boost ON,
-// then the campaign stops by itself. A user can change their channel link at any time (the old campaign is replaced).
-// WhatsApp keeps ONE reaction per account per message, so the 10 reactions come from 10 different accounts.
+// 1) BRAND CHANNEL (internal): every connected session follows the NEXORA MD channel and, for each new post,
+//    the sessions share the work: a random target of 34, 40 or 70 reactions (hard cap 90), each with a DIFFERENT emoji.
+//
+// 2) .channelreact : a user gives THEIR channel link; for 5 days every connected session (that has .channelreact ON)
+//    reacts to each new post of that channel with 10 different emojis spread over the sessions, and also reacts to the
+//    10 latest posts when the campaign starts (so each connected person is worth 10 reactions). Then it stops by itself.
+//    WhatsApp keeps ONE reaction per account per message, so one account cannot add 10 reactions to the same post.
 
 const BOOST_DAYS = 5;
 export const BOOST_MS = BOOST_DAYS * 24 * 3600 * 1000;
-const EMOJI_COUNT = 10; // reactions (and emojis) per post
+const EMOJI_COUNT = 10; // different emojis per campaign
 const MAX_CAMPAIGNS = 20; // channels boosted at the same time
+const TARGETS = [34, 40, 70];
+const MAX_REACTIONS = 90;
+const BACKFILL_POSTS = 10;
 const MAX_POST_AGE_SEC = 10 * 60; // never react to old posts replayed after a restart
 
 export const EMOJIS = [...new Set([
@@ -164,7 +170,7 @@ export async function startBoost(sock, link, ownerId) {
   };
   campaigns.set(id, campaign); // replaces the previous channel of this user
   await saveState();
-  for (const refresh of refreshers) refresh(); // sessions follow the new channel
+  for (const refresh of refreshers) refresh(campaign); // sessions follow the new channel and react to its latest posts
   return { ok: true, campaign: { ...campaign } };
 }
 
@@ -174,54 +180,110 @@ export function stopBoost(ownerId) {
   return had;
 }
 
-const posts = new Map(); // "jid:serverId" -> state
+const posts = new Map(); // "jid:serverId" -> state (campaign channels)
+const brandPosts = new Map(); // "jid:serverId" -> state (brand channel)
 const MAX_TRACKED = 300;
+const trim = (map) => { if (map.size > MAX_TRACKED) map.delete(map.keys().next().value); };
+const postId = (message) => message?.key?.server_id || message?.newsletterServerId || message?.newsletter_server_id;
+const fresh = (message) => {
+  const ts = tsOf(message);
+  return !ts || Date.now() / 1000 - ts <= MAX_POST_AGE_SEC;
+};
 
+/** Brand channel: sessions share the work, random target (34 / 40 / 70), a different emoji per reaction. */
+function handleBrandPost(socket, message, log) {
+  const serverId = postId(message);
+  if (!serverId || !fresh(message)) return;
+  const key = `${channel.jid}:${serverId}`;
+  let st = brandPosts.get(key);
+  if (!st) {
+    st = { target: Math.min(MAX_REACTIONS, pick(TARGETS), EMOJIS.length), claimed: 0, emojis: shuffle(EMOJIS), sessions: new Set() };
+    brandPosts.set(key, st);
+    trim(brandPosts);
+  }
+  const me = sessionId(socket);
+  if (st.sessions.has(me)) return;
+  st.sessions.add(me);
+  if (st.claimed >= st.target) return;
+  const slot = st.claimed++;
+  const emoji = st.emojis[slot];
+  const timer = setTimeout(async () => {
+    try {
+      await socket.newsletterReactMessage(channel.jid, String(serverId), emoji);
+    } catch (e) {
+      log('warn', 'channel reaction failed', { err: String(e?.message || e).slice(0, 60) });
+    }
+  }, slot * 120 + Math.floor(Math.random() * 1500));
+  timer.unref?.();
+}
+
+/** Campaign channel (.channelreact): every enabled session reacts once, emojis spread over the 10 of the campaign. */
 export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
   sweep();
   const c = byJid().get(jid);
   if (!c) return;
-  const me = sessionId(socket);
-  if (me === c.ownerId) return; // the channel's owner does not react to their own posts
-  const serverId = message?.key?.server_id || message?.newsletterServerId || message?.newsletter_server_id;
-  if (!serverId) return;
-  const ts = tsOf(message);
-  if (ts && Date.now() / 1000 - ts > MAX_POST_AGE_SEC) return;
-
+  const serverId = postId(message);
+  if (!serverId || !fresh(message)) return;
   const key = `${jid}:${serverId}`;
   let st = posts.get(key);
   if (!st) {
     st = { claimed: 0, emojis: shuffle(c.emojis), sessions: new Set() };
     posts.set(key, st);
-    if (posts.size > MAX_TRACKED) posts.delete(posts.keys().next().value);
+    trim(posts);
   }
+  const me = sessionId(socket);
   if (st.sessions.has(me)) return; // one reaction per session per post
   st.sessions.add(me);
-
   if (typeof isEnabled === 'function' && !isEnabled()) return;
 
-  // random delay: the 10 reactions of a post come from different, randomly chosen sessions
-  const wait = 500 + Math.floor(Math.random() * 6000);
+  const slot = st.claimed++;
+  const emoji = st.emojis[slot % st.emojis.length];
   const timer = setTimeout(async () => {
-    if (st.claimed >= EMOJI_COUNT || Date.now() >= c.until) return;
-    const emoji = st.emojis[st.claimed++];
+    if (Date.now() >= c.until) return;
     try {
       await socket.newsletterReactMessage(jid, String(serverId), emoji);
     } catch (e) {
-      log('warn', 'channel boost reaction failed', { err: String(e?.message || e).slice(0, 60) });
+      log('warn', 'channel react failed', { err: String(e?.message || e).slice(0, 60) });
     }
-  }, wait);
+  }, Math.min(slot * 150, 40_000) + Math.floor(Math.random() * 1500));
   timer.unref?.();
 }
 
+/** When a campaign starts: this session reacts to the latest posts of the channel (up to 10). */
+async function backfill(socket, c, log) {
+  if (typeof socket.newsletterFetchMessages !== 'function') return;
+  let list;
+  try {
+    list = await socket.newsletterFetchMessages('jid', c.jid, BACKFILL_POSTS);
+  } catch (e) {
+    log('warn', 'channel react: could not fetch latest posts', { err: String(e?.message || e).slice(0, 60) });
+    return;
+  }
+  const ids = (Array.isArray(list) ? list : list?.messages || [])
+    .map((x) => x?.server_id || x?.id || x?.key?.server_id)
+    .filter(Boolean)
+    .slice(0, BACKFILL_POSTS);
+  const offset = Math.floor(Math.random() * c.emojis.length);
+  for (const [i, id] of ids.entries()) {
+    await new Promise((r) => setTimeout(r, 1500 + Math.floor(Math.random() * 2500)));
+    if (Date.now() >= c.until) return;
+    try {
+      await socket.newsletterReactMessage(c.jid, String(id), c.emojis[(i + offset) % c.emojis.length]);
+    } catch (e) {
+      log('warn', 'channel react (latest post) failed', { err: String(e?.message || e).slice(0, 60) });
+    }
+  }
+}
+
 /**
- * Attaches the booster to one socket: reacts to posts + keeps the live-updates subscriptions alive.
+ * Attaches the reactions to one socket: brand channel (always) + campaign channels (when isEnabled()).
  * Returns dispose() — call it when the socket is closed.
  */
 export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFile: file } = {}) {
   let timer = null;
   let disposed = false;
   const ready = file ? loadState(file) : Promise.resolve();
+  const enabled = () => typeof isEnabled !== 'function' || isEnabled();
 
   const onUpsert = ({ messages }) => {
     if (disposed) return;
@@ -229,29 +291,32 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
       const jid = message?.key?.remoteJid;
       if (!jid || !String(jid).endsWith('@newsletter')) continue;
       try {
-        handlePost(socket, message, jid, isEnabled, log);
+        if (jid === channel.jid) handleBrandPost(socket, message, log);
+        else handlePost(socket, message, jid, isEnabled, log);
       } catch (e) {
-        log('warn', 'channel boost error', { err: String(e?.message || e).slice(0, 60) });
+        log('warn', 'channel reaction error', { err: String(e?.message || e).slice(0, 60) });
       }
     }
   };
 
-  // Follow the boosted channels (needed to react) and keep live updates flowing.
+  // Follow the channels (needed to react) and keep live updates flowing.
   const followed = new Set();
+  const follow = async (jid) => {
+    if (!followed.has(jid) && typeof socket.newsletterFollow === 'function') {
+      try { await socket.newsletterFollow(jid); } catch { /* already following */ }
+      followed.add(jid);
+    }
+    if (typeof socket.subscribeNewsletterUpdates === 'function') {
+      try { await socket.subscribeNewsletterUpdates(jid); } catch { /* retried on the next tick */ }
+    }
+  };
   const subscribe = async () => {
     if (disposed) return;
     await ready;
-    if (typeof isEnabled === 'function' && !isEnabled()) return;
-    for (const c of activeCampaigns()) {
-      if (c.ownerId === sessionId(socket)) continue;
-      if (!followed.has(c.jid) && typeof socket.newsletterFollow === 'function') {
-        try { await socket.newsletterFollow(c.jid); } catch { /* already following */ }
-        followed.add(c.jid);
-      }
-      if (typeof socket.subscribeNewsletterUpdates === 'function') {
-        try { await socket.subscribeNewsletterUpdates(c.jid); } catch { /* retried on the next tick */ }
-      }
-    }
+    await resolveChannel(socket);
+    await follow(channel.jid); // brand channel: every connected session joins it automatically
+    if (!enabled()) return;
+    for (const c of activeCampaigns()) await follow(c.jid);
   };
 
   const onConn = ({ connection }) => {
@@ -264,7 +329,11 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
     if (connection === 'close') clearInterval(timer);
   };
 
-  const refresh = () => subscribe().catch(() => {});
+  const refresh = (campaign) => {
+    subscribe()
+      .then(() => (campaign && enabled() ? backfill(socket, campaign, log) : undefined))
+      .catch(() => {});
+  };
   refreshers.add(refresh);
   socket.ev.on('messages.upsert', onUpsert);
   socket.ev.on('connection.update', onConn);
