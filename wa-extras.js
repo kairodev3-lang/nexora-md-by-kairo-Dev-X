@@ -1,4 +1,4 @@
-// WhatsApp commands that need the socket: .apk, .unblock, .save, .telegram, .tiktok, .facebook, .instagram, settings (.autoread, …).
+// WhatsApp commands that need the socket: .apk, .unblock, .save, .telegram, .tt, .fc, .ig, .mediafire, settings (.autoread, …).
 // Reserved for the owner of the linked account: engine-baileys.js only calls this module for
 // messages written BY the owner (other people only get the public commands in public mode).
 // Settings are stored in settings.json (the user's session folder, deleted with the session).
@@ -9,7 +9,7 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, reactLatest } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
 export { isPublicHttps };
 
@@ -21,7 +21,7 @@ const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 const MAX_STICKERS = 100; // Telegram packs hold up to 120 stickers
 const DEFAULT_STICKERS = 20;
 const BLOCK_DEFAULT = 5;
-const BLOCK_MAX = 50;
+const BLOCK_MAX = 500;
 const BLOCK_GAP_MS = 2000; // pause between two block / unblock calls (WhatsApp rate limits)
 const TG_PROGRESS_FILE = 'tg-progress.json';
 
@@ -67,22 +67,23 @@ const CMD_ALIASES = {
   tgsticker: 'telegram', tg: 'telegram',
   jid: 'getid', chatid: 'getid', gjid: 'getid', mylid: 'getid',
   channelid: 'idch', chid: 'idch',
-  fb: 'facebook', fbdl: 'facebook',
-  ig: 'instagram', igdl: 'instagram', insta: 'instagram',
-  tt: 'tiktok', tiktokdl: 'tiktok',
+  facebook: 'fc', fb: 'fc', fbdl: 'fc',
+  instagram: 'ig', igdl: 'ig', insta: 'ig',
+  tiktok: 'tt', tiktokdl: 'tt',
+  mf: 'mediafire',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
-  'tiktok', 'facebook', 'instagram',
+  'tt', 'fc', 'ig', 'mediafire',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── public mode: what other people may use ───────── */
 // Everything else (settings, unblock, save, pair, telegram, getid, mode…) stays owner-only.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
-const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tiktok', 'facebook', 'instagram', 'twitter', 'pinterest', 'sticker', 'tourl']);
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
+const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
@@ -243,7 +244,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       return reply(box('🚫 BLOCK', [
         `Usage : *${P()}block <times> <number>*`,
         `Example : *${P()}block 10 +50912345678*`,
-        `Times : 1 to ${BLOCK_MAX} (default ${BLOCK_DEFAULT}), e.g. 10 or 50`,
+        `Times : 1 to ${BLOCK_MAX} (default ${BLOCK_DEFAULT}), e.g. 10, 50 or 500`,
         'Works in any chat. You can also reply to a message.',
         'Each time = 1 block then 1 unblock. Ends unblocked.',
       ]));
@@ -343,28 +344,34 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
   };
 
-  /* ───────── .pinterest ───────── */
+  /* ───────── .pinterest <search> : up to 5 images ───────── */
   async function pinterest(q, { reply, jid, m }) {
-    if (!q) return reply(box('📌 PINTEREST', [`Usage : *${P()}pinterest <link>*`, 'pinterest.com or pin.it link']));
-    let host = '';
-    try {
-      host = new URL(q.trim()).hostname.toLowerCase();
-    } catch {
-      /* invalid link */
-    }
-    if (!/(^|\.)(pinterest\.[a-z.]+|pin\.it)$/.test(host)) return reply(box('❌ PINTEREST', ['Invalid link: use a pinterest.com or pin.it link.']));
-    react(jid, m, '⏳');
-    const data = await getJson(`https://jawad-tech.vercel.app/download/pinterest?url=${encodeURIComponent(q.trim())}`);
-    const r = data?.result;
-    if (!data?.status || !r?.url || !isPublicHttps(r.url)) {
+    const query = String(q || '').trim().slice(0, 100);
+    if (!query) return reply(box('📌 PINTEREST', [`Usage : *${P()}pinterest <search>*`, `Example : *${P()}pinterest nature*`]));
+    react(jid, m, '🔍');
+    const token = process.env.PINTEREST_API_TOKEN || 'SYDHKj';
+    const data = await getJson(`https://whiteshadow-x-api.onrender.com/api/search/pinterest?q=${encodeURIComponent(query)}&apitoken=${encodeURIComponent(token)}`, 40_000);
+    const results = data?.results || data?.result || data?.data || data?.images;
+    const items = Array.isArray(results) ? results : results ? [results] : [];
+    const urls = items
+      .map((it) => (typeof it === 'string' ? it : it?.image || it?.imageUrl || it?.url || it?.src || it?.thumbnail))
+      .filter((u) => typeof u === 'string' && isPublicHttps(u))
+      .slice(0, 5);
+    if (!urls.length) {
       react(jid, m, '❌');
-      return reply(box('❌ PINTEREST', ['Could not fetch this media.', 'Check the link and try again.']));
+      return reply(box('❌ PINTEREST', ['No image found.']));
     }
-    if ((await remoteSize(r.url)) > MAX_MEDIA_BYTES) return reply(box('❌ PINTEREST', ['File too big (max 100 MB).']));
-    const isVideo = r.type === 'video' || /\.mp4(\?|$)/i.test(r.url);
-    const caption = box('📌 PINTEREST', [`Title : *${String(r.title || '—').slice(0, 80)}*`, `Type  : *${isVideo ? 'Video' : 'Image'}*`]);
-    await send(jid, isVideo ? { video: { url: r.url }, mimetype: 'video/mp4', caption } : { image: { url: r.url }, caption }, m, true);
-    react(jid, m, '✅');
+    let sent = 0;
+    for (const [i, u] of urls.entries()) {
+      try {
+        await send(jid, { image: { url: u }, caption: i === 0 ? `📌 *${query}*` : '' }, m, true);
+        sent++;
+      } catch (e) {
+        log('warn', 'pinterest image failed', { err: String(e?.message || '').slice(0, 60) });
+      }
+    }
+    react(jid, m, sent ? '✅' : '❌');
+    return sent ? null : reply(box('❌ PINTEREST', ['Could not send the images.']));
   }
 
   /* ───────── .telegram <link> <pack name> [| author] <amount> : Telegram sticker pack → WhatsApp stickers ───────── */
@@ -569,14 +576,19 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       return reply(box('❌ CHANNEL REACT', [why, 'Example : https://whatsapp.com/channel/XXXX']));
     }
     try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
-    return reply(box('📣 CHANNEL REACT ✅', [
+    await reply(box('📣 CHANNEL REACT ✅', [
       `Channel : *${r.campaign.name || '—'}*`,
       r.campaign.url,
-      `Reactions : *10 per connected account*`,
       `Emojis : ${r.campaign.emojis.join(' ')}`,
-      'Duration : *5 days*, then it stops by itself.',
-      `Change channel : *${P()}channelreact <new link>*`,
+      'Sending your 10 reactions…',
     ]));
+    // Works with ONE connected user: this very account reacts to the 10 latest posts (other accounts only add more).
+    try { await sock.newsletterFollow?.(r.campaign.jid); } catch { /* already following */ }
+    const res = await reactLatest(sock, r.campaign, log);
+    const lines = res.sent
+      ? [`Reactions sent : *${res.sent}/10*`, 'New posts : reacted automatically for *5 days*, then it stops.', `Change channel : *${P()}channelreact <new link>*`]
+      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'New posts will still be reacted to for 5 days.'];
+    return reply(box(res.sent ? '✅ CHANNEL REACT' : '⚠️ CHANNEL REACT', lines));
   }
 
   async function channelBoostCmd(args, { reply }) {
