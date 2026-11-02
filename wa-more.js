@@ -20,7 +20,6 @@ export const MORE_ALIASES = {
 export const MORE_NAMES = ['sticker', 'song', 'video', 'twitter', 'tourl', 'viewonce', 'vv2', 'kick', 'kickall', 'tagall', 'ping', 'alive', 'owner', 'help'];
 
 const MAX_VIDEO_BYTES = 100 * 1024 * 1024;
-const MAX_AUDIO_BYTES = 60 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 const MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_VIDEO_SECONDS = 30 * 60;
@@ -208,95 +207,111 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
     }
   }
 
-  /* ───────── .song / .video (YouTube, several fallback servers) ───────── */
-  const enc = encodeURIComponent;
-  const servers = (url, kind) =>
-    kind === 'video'
-      ? [
-          async () => { const d = await getJson(`https://eliteprotech-apis.zone.id/ytdown?url=${enc(url)}&format=mp4`); return d?.success && d.downloadURL ? { url: d.downloadURL, title: d.title } : null; },
-          async () => { const d = await getJson(`https://api.yupra.my.id/api/downloader/ytmp4?url=${enc(url)}`); return d?.success && d.data?.download_url ? { url: d.data.download_url, title: d.data.title, thumb: d.data.thumbnail } : null; },
-          async () => { const d = await getJson(`https://okatsu-rolezapiiz.vercel.app/downloader/ytmp4?url=${enc(url)}`); return d?.result?.mp4 ? { url: d.result.mp4, title: d.result.title } : null; },
-        ]
-      : [
-          async () => { const d = await getJson(`https://api.giftedtech.web.id/api/download/ytmp3?apikey=gifted&url=${enc(url)}`, 25_000); return d?.result?.download_url ? { url: d.result.download_url, title: d.result.title } : null; },
-          async () => { const d = await getJson(`https://apis-keith.vercel.app/download/dlmp3?url=${enc(url)}`); return d?.status && d.result?.downloadUrl ? { url: d.result.downloadUrl, title: d.result.title } : null; },
-          async () => {
-            const mod = await import('ruhend-scraper');
-            const d = await (mod.ytmp3 || mod.default?.ytmp3)(url);
-            const u = d?.audio || d?.url || d?.download;
-            return u ? { url: u, title: d?.title } : null;
-          },
-          async () => { const d = await getJson(`https://eliteprotech-apis.zone.id/ytdown?url=${enc(url)}&format=mp3`); return d?.success && d.downloadURL ? { url: d.downloadURL, title: d.title } : null; },
-          async () => { const d = await getJson(`https://api.yupra.my.id/api/downloader/ytmp3?url=${enc(url)}`); return d?.success && d.data?.download_url ? { url: d.data.download_url, title: d.data.title, thumb: d.data.thumbnail } : null; },
-          async () => { const d = await getJson(`https://okatsu-rolezapiiz.vercel.app/downloader/ytmp3?url=${enc(url)}`); return d?.result?.mp3 ? { url: d.result.mp3, title: d.result.title } : null; },
-        ];
-  async function viaServers(url, kind) {
-    for (const [i, run] of servers(url, kind).entries()) {
-      try {
-        const r = await run();
-        if (r?.url && isPublicHttps(r.url, true)) return r;
-      } catch (e) {
-        log('warn', 'wa download server failed', { kind, server: i, why: String(e?.message || '').slice(0, 40) });
-      }
-    }
-    return null;
-  }
-  async function youtube(kind, q, { jid, m, reply }) {
-    const name = kind === 'video' ? 'video' : 'song';
-    const label = kind === 'video' ? '🎬 VIDEO' : '🎵 SONG';
-    if (!q) return reply(box(label, [`Usage : *${P()}${name} <name or YouTube link>*`, `Example : *${P()}${name} perfect ed sheeran*`]));
-    let yts;
+  /* ───────── .song / .video (YouTube) ───────── */
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const loadYts = async () => {
     try {
       const mod = await import('yt-search');
-      yts = mod.default || mod;
+      return mod.default || mod;
     } catch {
-      return reply(box('❌ YOUTUBE', ['The yt-search module is not installed on the server.']));
+      return null;
     }
-    react(jid, m, '🔍');
-    let v;
-    if (/^https?:\/\//i.test(q.trim())) {
-      const id = youtubeId(q.trim());
-      if (!id) return reply(box('❌ YOUTUBE', ['Invalid link: only YouTube links are accepted.']));
-      v = await yts({ videoId: id }).catch(() => null);
-      v = v || { url: `https://youtube.com/watch?v=${id}`, title: '' };
-    } else {
-      v = (await yts(q)).videos?.[0];
-    }
-    if (!v) {
-      react(jid, m, '❌');
-      return reply(box('❌ YOUTUBE', ['No results found.']));
-    }
-    if (toNum(v.seconds) > MAX_VIDEO_SECONDS) return reply(box('❌ YOUTUBE', ['Content too long (max 30 minutes).']));
+  };
+
+  // .song : @vreden/youtube_scraper (retried once), then apis-keith as a fallback.
+  async function ytSong({ q, jid, m, reply }) {
+    if (!q) return reply(box('🎵 SONG', [`Usage : *${P()}song <name>*`, `Example : *${P()}song faded alan walker*`]));
+    const yts = await loadYts();
+    if (!yts) return reply(box('❌ SONG', ['The yt-search module is not installed on the server.']));
     react(jid, m, '⏳');
-    const r = await viaServers(v.url, kind);
-    if (!r) {
+    let video;
+    try {
+      video = (await yts(q)).videos?.[0];
+    } catch {
       react(jid, m, '❌');
-      return reply(box('❌ YOUTUBE', ['Audio not generated: all servers failed.', 'Try again later.']));
+      return reply(box('❌ SONG', ['Search failed.']));
     }
-    if ((await remoteSize(r.url)) > (kind === 'video' ? MAX_VIDEO_BYTES : MAX_AUDIO_BYTES)) {
-      return reply(box('❌ YOUTUBE', ['File too big for WhatsApp.']));
+    if (!video) {
+      react(jid, m, '❌');
+      return reply(box('❌ SONG', ['Song not found.']));
     }
-    const title = String(r.title || v.title || 'YouTube').slice(0, 100);
-    const thumb = [r.thumb, v.thumbnail, v.image].find((x) => x && isPublicHttps(x));
-    if (kind === 'video') {
-      await send(jid, {
-        video: { url: r.url },
-        mimetype: 'video/mp4',
-        fileName: `${cleanTitle(title)}.mp4`,
-        caption: box(label, [`Title    : *${title}*`, `Duration : *${v.timestamp || '—'}*`, `Bot      : *${brand().bot}*`]),
-      }, m, true);
-    } else {
-      await send(jid, {
-        audio: { url: r.url },
-        mimetype: 'audio/mpeg',
-        fileName: `${cleanTitle(title)}.mp3`,
-        contextInfo: {
-          externalAdReply: { title, body: `${brand().bot} MUSIC`, ...(thumb ? { thumbnailUrl: thumb } : {}), sourceUrl: v.url, mediaType: 1, renderLargerThumbnail: true },
-        },
-      }, m, true);
-      await send(jid, box(label, [`Title    : *${title}*`, `Duration : *${v.timestamp || '—'}*`, `Bot      : *${brand().bot}*`]), m, true);
+
+    let data = null;
+    for (let attempt = 0; attempt < 2 && !data; attempt++) {
+      try {
+        const mod = await import('@vreden/youtube_scraper');
+        const ytmp3 = mod.ytmp3 || mod.default?.ytmp3;
+        data = await ytmp3(video.url);
+      } catch (e) {
+        log('warn', 'song: vreden failed', { attempt, why: String(e?.message || '').slice(0, 50) });
+        if (attempt === 0) await sleep(2500);
+      }
     }
+    let dlUrl = data?.status && data?.download?.url ? data.download.url : null;
+    let title = data?.metadata?.title || video.title;
+    const author = data?.metadata?.author?.name || video.author?.name;
+    const durSec = Number(data?.metadata?.duration?.seconds ?? data?.metadata?.seconds ?? video.seconds ?? 0) || 0;
+    const thumb = data?.metadata?.thumbnail || video.thumbnail;
+
+    if (!dlUrl) {
+      try {
+        const d = await getJson(`https://apis-keith.vercel.app/download/dlmp3?url=${encodeURIComponent(video.url)}`, 30_000);
+        if (d?.status && d?.result?.downloadUrl) {
+          dlUrl = d.result.downloadUrl;
+          title = d.result.title || title;
+        }
+      } catch (e) {
+        log('warn', 'song: apis-keith failed', { why: String(e?.message || '').slice(0, 50) });
+      }
+    }
+    if (!dlUrl || !isPublicHttps(dlUrl, true)) {
+      react(jid, m, '❌');
+      return reply(box('❌ SONG', ['Failed to fetch the music.', 'All sources failed.']));
+    }
+
+    const dur = durSec ? `${Math.floor(durSec / 60)}:${String(durSec % 60).padStart(2, '0')}` : 'N/A';
+    const caption = box('🎵 SONG', [`Title    : *${cleanTitle(title, 90)}*`, `Author   : *${cleanTitle(author || 'Unknown', 40)}*`, `Duration : *${dur}*`]);
+    if (thumb && isPublicHttps(thumb)) await send(jid, { image: { url: thumb }, caption }, m, true);
+    else await send(jid, caption, m, true);
+    await send(jid, { audio: { url: dlUrl }, mimetype: 'audio/mpeg', ptt: false, fileName: `${cleanTitle(title) || 'song'}.mp3` }, m, true);
     react(jid, m, '✅');
+    return null;
+  }
+
+  // .video : ruhend-scraper ytmp4 (a YouTube link or a search).
+  async function ytVideo({ q, jid, m, reply }) {
+    if (!q) return reply(box('🎬 VIDEO', [`Usage : *${P()}video <name or YouTube link>*`, `Example : *${P()}video pasoori*`]));
+    react(jid, m, '⏳');
+    try {
+      let videoUrl = q.trim();
+      if (/^https?:\/\//i.test(videoUrl)) {
+        if (!youtubeId(videoUrl)) return reply(box('❌ VIDEO', ['Invalid link: only YouTube links are accepted.']));
+      } else {
+        const yts = await loadYts();
+        if (!yts) return reply(box('❌ VIDEO', ['The yt-search module is not installed on the server.']));
+        const v = (await yts(videoUrl)).videos?.[0];
+        if (!v) {
+          react(jid, m, '❌');
+          return reply(box('❌ VIDEO', ['No results found.']));
+        }
+        if (toNum(v.seconds) > MAX_VIDEO_SECONDS) return reply(box('❌ VIDEO', ['Video too long (max 30 minutes).']));
+        videoUrl = v.url;
+      }
+      const mod = await import('ruhend-scraper');
+      const data = await (mod.ytmp4 || mod.default?.ytmp4)(videoUrl);
+      const finalUrl = data?.video || data?.url || data?.download;
+      if (!finalUrl || !isPublicHttps(finalUrl, true)) {
+        react(jid, m, '❌');
+        return reply(box('❌ VIDEO', ['No downloadable video found.']));
+      }
+      await send(jid, { video: { url: finalUrl }, mimetype: 'video/mp4', caption: box('🎬 VIDEO', [`Title : *${cleanTitle(data?.title || 'Video', 90)}*`]) }, m, true);
+      react(jid, m, '✅');
+    } catch (e) {
+      log('warn', 'video failed', { why: String(e?.message || '').slice(0, 60) });
+      react(jid, m, '❌');
+      return reply(box('❌ VIDEO', ['Error while fetching the video.']));
+    }
+    return null;
   }
 
   /* ───────── .twitter / .x ───────── */
@@ -425,8 +440,8 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
 
   return {
     ping, alive, owner, help, sticker, tourl, kick, kickall, tagall,
-    song: (c) => youtube('audio', c.q, c),
-    video: (c) => youtube('video', c.q, c),
+    song: (c) => ytSong(c),
+    video: (c) => ytVideo(c),
     twitter: (c) => twitter(c.q, c),
     viewonce: (c) => viewonce(false, c),
     vv2: (c) => viewonce(true, c),
