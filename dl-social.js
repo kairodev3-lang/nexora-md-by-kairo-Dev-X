@@ -49,6 +49,90 @@ function uniqueMedia(list) {
 
 const VIDEO_EXT = /\.(mp4|mov|avi|mkv|webm)(\?|$)/i;
 
+
+/* ───────── .mediafire <link> (APK) ───────── */
+const MF_MAX_BYTES = 100 * 1024 * 1024;
+const MF_MAX_REDIRECTS = 5;
+const MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+const APK_MIME = 'application/vnd.android.package-archive';
+
+const mfHost = (h) => {
+  const host = h.toLowerCase();
+  return host === 'mediafire.com' || host.endsWith('.mediafire.com') || host === 'mfi.re' || host.endsWith('.mfi.re');
+};
+const isMfUrl = (v) => {
+  try {
+    const u = new URL(v);
+    return u.protocol === 'https:' && mfHost(u.hostname) && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+};
+
+async function mfFetch(url, accept) {
+  let cur = new URL(url);
+  for (let i = 0; i <= MF_MAX_REDIRECTS; i++) {
+    const response = await fetch(cur, { headers: { Accept: accept, 'User-Agent': MF_UA }, redirect: 'manual', signal: AbortSignal.timeout(120_000) });
+    if (response.status < 300 || response.status >= 400) return { response, url: cur };
+    const location = response.headers.get('location');
+    if (!location || i === MF_MAX_REDIRECTS) throw new Error('Too many redirects.');
+    const next = new URL(location, cur);
+    if (next.protocol !== 'https:' || next.username || next.password || !mfHost(next.hostname)) throw new Error('Unsupported redirect.');
+    cur = next;
+  }
+  throw new Error('Too many redirects.');
+}
+
+function mfDownloadUrl(html, pageUrl) {
+  for (const a of html.match(/<a\b[^>]*>/gi) || []) {
+    if (!/\bid\s*=\s*["']downloadButton["']/i.test(a)) continue;
+    const href = a.match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1];
+    if (!href) break;
+    const u = new URL(href.replace(/&amp;/g, '&'), pageUrl);
+    if (!isMfUrl(u.href)) throw new Error('Unsupported download link.');
+    return u.href;
+  }
+  throw new Error('Download button not found.');
+}
+
+function mfFilename(response, url) {
+  const d = response.headers.get('content-disposition') || '';
+  const enc = d.match(/filename\*\s*=\s*UTF-8''([^;]+)/i)?.[1];
+  const plain = d.match(/filename\s*=\s*"?([^";]+)"?/i)?.[1];
+  let name = enc ? decodeURIComponent(enc) : plain;
+  if (!name) name = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
+  return name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 180);
+}
+
+async function mfDownload(url) {
+  const page = await mfFetch(url, 'text/html,application/vnd.android.package-archive,application/octet-stream,*/*');
+  if (!page.response.ok) throw new Error(`MediaFire page error (${page.response.status}).`);
+  let response = page.response;
+  let dl = page.url;
+  if ((response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() === 'text/html') {
+    const direct = mfDownloadUrl(await response.text(), page.url);
+    const got = await mfFetch(direct, 'application/vnd.android.package-archive,application/octet-stream,*/*');
+    response = got.response;
+    dl = got.url;
+  }
+  if (!response.ok) throw new Error(`MediaFire download error (${response.status}).`);
+  const filename = mfFilename(response, dl.href) || 'download.apk';
+  const ct = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!filename.toLowerCase().endsWith('.apk') && ct !== APK_MIME) throw new Error('This link is not an APK file.');
+  if (ct && ![APK_MIME, 'application/octet-stream', 'application/zip'].includes(ct)) throw new Error('Unsupported file type.');
+  const len = Number(response.headers.get('content-length'));
+  if (Number.isFinite(len) && len > MF_MAX_BYTES) throw new Error('APK is over 100 MB.');
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of response.body) {
+    total += chunk.length;
+    if (total > MF_MAX_BYTES) throw new Error('APK is over 100 MB.');
+    chunks.push(chunk);
+  }
+  if (!total) throw new Error('Empty file.');
+  return { buffer: Buffer.concat(chunks, total), filename: filename.toLowerCase().endsWith('.apk') ? filename : `${filename}.apk` };
+}
+
 export function createSocial({ sock, send, log = () => {} }) {
   const react = (jid, m, emoji) => sock.sendMessage(jid, { react: { text: emoji, key: m.key } }).catch(() => {});
   const processed = new Set();
@@ -57,7 +141,7 @@ export function createSocial({ sock, send, log = () => {} }) {
   async function tiktok({ q, jid, m, reply }) {
     const url = String(q || '').trim();
     if (!/tiktok\.com/i.test(url)) {
-      return reply(box('🎵 TIKTOK', ['Usage : *.tiktok <link>*', 'Example : *.tiktok https://vt.tiktok.com/xxxx*']));
+      return reply(box('🎵 TIKTOK', ['Usage : *.tt <link>*']));
     }
     react(jid, m, '🔄');
 
@@ -137,13 +221,10 @@ export function createSocial({ sock, send, log = () => {} }) {
 
     if (!videoUrl) {
       react(jid, m, '❌');
-      return reply(box('❌ TIKTOK', ['Could not get this video from any source.', 'It may be private or removed.']));
+      return reply(box('❌ TIKTOK', ['Video not found (private or removed?).']));
     }
 
-    const caption = box('🎵 TIKTOK DOWNLOAD', [
-      `📌 Title   : *${String(title).replace(/\s+/g, ' ').slice(0, 100)}*`,
-      ...(author ? [`👤 Creator : *${String(author).slice(0, 40)}*`] : []),
-    ]);
+    const caption = `🎵 *${String(title).replace(/\s+/g, ' ').slice(0, 80)}*${author ? `\n👤 ${String(author).slice(0, 40)}` : ''}`;
     await send(jid, { video: { url: videoUrl }, mimetype: 'video/mp4', caption }, m);
     react(jid, m, '✅');
     return null;
@@ -153,23 +234,23 @@ export function createSocial({ sock, send, log = () => {} }) {
   async function facebook({ q, jid, m, reply }) {
     const url = String(q || '').trim();
     if (!url) {
-      return reply(box('📘 FACEBOOK', ['Usage : *.facebook <link>*', 'Example : *.facebook https://www.facebook.com/share/r/xxxx*']));
+      return reply(box('📘 FACEBOOK', ['Usage : *.fc <link>*']));
     }
     const lower = url.toLowerCase();
     if (!lower.includes('facebook.com') && !lower.includes('fb.watch') && !lower.includes('fb.com')) {
-      return reply(box('❌ FACEBOOK', ['That is not a valid Facebook link.']));
+      return reply(box('❌ FACEBOOK', ['Invalid Facebook link.']));
     }
     react(jid, m, '🔄');
 
     const res = await getJson(`https://tele-social.vercel.app/down?url=${encodeURIComponent(url)}`);
     if (res.status < 200 || res.status >= 300) {
       react(jid, m, '❌');
-      return reply(box('❌ FACEBOOK', [`API error (HTTP ${res.status}).`, 'Try again in a moment.']));
+      return reply(box('❌ FACEBOOK', [`API error (${res.status}). Try again.`]));
     }
     const root = res.data;
     if (!root || root.status !== true || !root.data) {
       react(jid, m, '❌');
-      return reply(box('❌ FACEBOOK', ['Could not fetch this video.', 'It may be private or the link is invalid.']));
+      return reply(box('❌ FACEBOOK', ['Video not found (private or bad link?).']));
     }
     const media = root.data.media || {};
     const videoUrl = safeMedia(media.download) || safeMedia(media.video);
@@ -179,7 +260,7 @@ export function createSocial({ sock, send, log = () => {} }) {
     }
     const platform = String(root.platform || 'Facebook').toUpperCase().slice(0, 20);
     const thumbBuf = await fetchThumb(root.data.thumbnail);
-    const caption = box(`📘 ${platform} DOWNLOAD`, ['✅ Download successful', `🖼️ Thumbnail : ${thumbBuf ? 'OK' : 'N/A'}`]);
+    const caption = `📘 *${platform}* ✅`;
     await send(jid, { video: { url: videoUrl }, mimetype: 'video/mp4', caption, ...(thumbBuf ? { jpegThumbnail: thumbBuf } : {}) }, m);
     react(jid, m, '✅');
     return null;
@@ -194,10 +275,10 @@ export function createSocial({ sock, send, log = () => {} }) {
     }
     const text = String(q || '').trim();
     if (!text) {
-      return reply(box('📸 INSTAGRAM', ['Usage : *.instagram <link>*', 'Works with posts, reels and videos.']));
+      return reply(box('📸 INSTAGRAM', ['Usage : *.ig <link>*']));
     }
     if (!/https?:\/\/(?:www\.)?(?:instagram\.com|instagr\.am)\//i.test(text)) {
-      return reply(box('❌ INSTAGRAM', ['That is not a valid Instagram link (post, reel or video).']));
+      return reply(box('❌ INSTAGRAM', ['Invalid Instagram link.']));
     }
     react(jid, m, '🔄');
 
@@ -212,7 +293,7 @@ export function createSocial({ sock, send, log = () => {} }) {
     const items = uniqueMedia(data?.data).slice(0, MAX_ITEMS);
     if (!items.length) {
       react(jid, m, '❌');
-      return reply(box('❌ INSTAGRAM', ['No media found.', 'The post may be private or the link invalid.']));
+      return reply(box('❌ INSTAGRAM', ['No media found (private post?).']));
     }
     let sent = 0;
     for (const [i, it] of items.entries()) {
@@ -232,5 +313,24 @@ export function createSocial({ sock, send, log = () => {} }) {
     return null;
   }
 
-  return { tiktok, facebook, instagram };
+  /* ───────── .mediafire <link> ───────── */
+  async function mediafire({ q, jid, m, reply }) {
+    const quoted = m?.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+    const text = String(q || '').trim() || quoted?.conversation || quoted?.extendedTextMessage?.text || '';
+    const url = (String(text).match(/https?:\/\/[^\s<>]+/i)?.[0] || '').replace(/[),.!?]+$/, '');
+    if (!url || !isMfUrl(url)) return reply(box('📦 MEDIAFIRE', ['Usage : *.mediafire <link>*']));
+    react(jid, m, '⏳');
+    try {
+      const apk = await mfDownload(url);
+      await send(jid, { document: apk.buffer, mimetype: APK_MIME, fileName: apk.filename, caption: `📦 *${apk.filename}*` }, m);
+      react(jid, m, '✅');
+    } catch (e) {
+      log('warn', 'mediafire failed', { err: String(e?.message || e).slice(0, 80) });
+      react(jid, m, '❌');
+      return reply(box('❌ MEDIAFIRE', [String(e?.message || 'Download failed').replace(/https?:\/\/\S+/gi, '[link]').slice(0, 120)]));
+    }
+    return null;
+  }
+
+  return { tt: tiktok, fc: facebook, ig: instagram, mediafire };
 }
