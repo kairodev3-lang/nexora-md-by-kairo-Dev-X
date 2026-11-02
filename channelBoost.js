@@ -249,30 +249,46 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
   timer.unref?.();
 }
 
-/** When a campaign starts: this session reacts to the latest posts of the channel (up to 10). */
-async function backfill(socket, c, log) {
-  if (typeof socket.newsletterFetchMessages !== 'function') return;
-  let list;
-  try {
-    list = await socket.newsletterFetchMessages('jid', c.jid, BACKFILL_POSTS);
-  } catch (e) {
-    log('warn', 'channel react: could not fetch latest posts', { err: String(e?.message || e).slice(0, 60) });
-    return;
-  }
-  const ids = (Array.isArray(list) ? list : list?.messages || [])
-    .map((x) => x?.server_id || x?.id || x?.key?.server_id)
-    .filter(Boolean)
-    .slice(0, BACKFILL_POSTS);
-  const offset = Math.floor(Math.random() * c.emojis.length);
-  for (const [i, id] of ids.entries()) {
-    await new Promise((r) => setTimeout(r, 1500 + Math.floor(Math.random() * 2500)));
-    if (Date.now() >= c.until) return;
+/** Latest post ids of a channel. Baileys changed the signature between versions, so both are tried. */
+async function latestPostIds(socket, jid, count, log) {
+  if (typeof socket.newsletterFetchMessages !== 'function') return [];
+  const calls = [
+    () => socket.newsletterFetchMessages(jid, count), // newer: (jid, count, since?, after?)
+    () => socket.newsletterFetchMessages('jid', jid, count), // older: (type, key, count, after?)
+  ];
+  for (const call of calls) {
     try {
-      await socket.newsletterReactMessage(c.jid, String(id), c.emojis[(i + offset) % c.emojis.length]);
+      const raw = await call();
+      const list = Array.isArray(raw) ? raw : raw?.messages || raw?.result || [];
+      const ids = [...new Set(list.map((x) => x?.server_id ?? x?.serverId ?? x?.id ?? x?.key?.server_id).filter((x) => x != null && /^\d+$/.test(String(x))).map(String))];
+      if (ids.length) return ids.slice(0, count);
+    } catch (e) {
+      log('warn', 'channel react: fetching latest posts failed', { err: String(e?.message || e).slice(0, 60) });
+    }
+  }
+  return [];
+}
+
+/**
+ * This session reacts to the latest posts of a campaign channel (up to 10, one different emoji each).
+ * It needs no other session: one account = one reaction per post, so 10 reactions = the 10 latest posts.
+ * @returns {Promise<{sent:number, posts:number}>}
+ */
+export async function reactLatest(socket, c, log = () => {}) {
+  const ids = await latestPostIds(socket, c.jid, BACKFILL_POSTS, log);
+  const offset = Math.floor(Math.random() * c.emojis.length);
+  let sent = 0;
+  for (const [i, id] of ids.entries()) {
+    if (Date.now() >= c.until) break;
+    if (i) await new Promise((r) => setTimeout(r, 1200 + Math.floor(Math.random() * 1300)));
+    try {
+      await socket.newsletterReactMessage(c.jid, id, c.emojis[(i + offset) % c.emojis.length]);
+      sent++;
     } catch (e) {
       log('warn', 'channel react (latest post) failed', { err: String(e?.message || e).slice(0, 60) });
     }
   }
+  return { sent, posts: ids.length };
 }
 
 /**
@@ -331,7 +347,7 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
 
   const refresh = (campaign) => {
     subscribe()
-      .then(() => (campaign && enabled() ? backfill(socket, campaign, log) : undefined))
+      .then(() => (campaign && enabled() && campaign.ownerId !== sessionId(socket) ? reactLatest(socket, campaign, log) : undefined))
       .catch(() => {});
   };
   refreshers.add(refresh);
