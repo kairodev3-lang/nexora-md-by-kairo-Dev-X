@@ -3,15 +3,15 @@
 // 1) BRAND CHANNEL (internal): every connected session follows the NEXORA MD channel and, for each new post,
 //    the sessions share the work: a random target of 34, 40 or 70 reactions (hard cap 90), each with a DIFFERENT emoji.
 //
-// 2) .channelreact : a user gives THEIR channel link; for 5 days every connected session (that has .channelreact ON)
-//    reacts to each new post of that channel with 10 different emojis spread over the sessions, and also reacts to the
-//    10 latest posts when the campaign starts (so each connected person is worth 10 reactions). Then it stops by itself.
+// 2) .channelreact : a user gives THEIR channel link; ONE burst of 10 reactions is sent right away (10 different emojis
+//    on the 10 latest posts of that channel). No automatic reactions afterwards.
+//    Limits (per user): 1 channel per day, and the SAME channel link can only be redone after 30 minutes.
 //    WhatsApp keeps ONE reaction per account per message, so one account cannot add 10 reactions to the same post.
 
-const BOOST_DAYS = 5;
-export const BOOST_MS = BOOST_DAYS * 24 * 3600 * 1000;
 const EMOJI_COUNT = 10; // different emojis per campaign
-const MAX_CAMPAIGNS = 20; // channels boosted at the same time
+const DAY_MS = 24 * 3600 * 1000;
+const DAILY_CHANNELS = 1; // new channels a user can boost per day (24h window)
+export const SAME_LINK_COOLDOWN_MS = 30 * 60 * 1000; // wait before redoing the same channel link
 const TARGETS = [34, 40, 70];
 const MAX_REACTIONS = 90;
 const BACKFILL_POSTS = 10;
@@ -84,24 +84,24 @@ const tsOf = (m) => {
 };
 
 
-/* ───────── campaigns (shared by all sessions of this process) ───────── */
+/* ───────── burst limits (shared by all sessions of this process) ───────── */
 const pickEmojis = () => shuffle(EMOJIS).slice(0, EMOJI_COUNT);
 
-/** ownerId (phone number of the session that asked) -> { ownerId, jid, name, url, emojis, until } */
-const campaigns = new Map();
-const byJid = () => new Map([...campaigns.values()].map((c) => [c.jid, c]));
+/** ownerId -> { windowStart, links: { [channelJid]: lastBurstAt } } */
+const usage = new Map();
 
-function sweep() {
-  for (const [id, c] of campaigns) if (Date.now() >= c.until) campaigns.delete(id);
+function currentUsage(id, now = Date.now()) {
+  const rec = usage.get(id);
+  if (rec && now - rec.windowStart >= DAY_MS) usage.delete(id); // new day window
+  return usage.get(id) || null;
 }
-export const activeCampaigns = () => {
-  sweep();
-  return [...campaigns.values()];
-};
-export const campaignOf = (ownerId) => {
-  sweep();
-  return campaigns.get(String(ownerId)) || null;
-};
+
+/** What this user already used today: { channels, windowEnd } or null. */
+export function boostStatus(ownerId) {
+  const rec = currentUsage(String(ownerId));
+  if (!rec) return null;
+  return { channels: Object.keys(rec.links).length, windowEnd: rec.windowStart + DAY_MS, links: { ...rec.links } };
+}
 
 const refreshers = new Set();
 let stateFile = null;
@@ -114,20 +114,12 @@ async function loadState(file) {
   try {
     const { readFile } = await import('node:fs/promises');
     const raw = JSON.parse(await readFile(file, 'utf8'));
-    for (const c of Array.isArray(raw) ? raw : []) {
-      if (typeof c?.jid !== 'string' || !c.jid.endsWith('@newsletter') || !c.ownerId) continue;
-      campaigns.set(String(c.ownerId), {
-        ownerId: String(c.ownerId),
-        jid: c.jid,
-        name: String(c.name || '').slice(0, 80),
-        url: String(c.url || '').slice(0, 200),
-        emojis: Array.isArray(c.emojis) && c.emojis.length === EMOJI_COUNT ? c.emojis.map(String) : pickEmojis(),
-        until: Number(c.until) || 0,
-      });
+    for (const [id, rec] of Object.entries(raw?.usage || {})) {
+      if (!rec || !Number(rec.windowStart) || typeof rec.links !== 'object') continue;
+      usage.set(String(id), { windowStart: Number(rec.windowStart), links: { ...rec.links } });
     }
-    sweep();
   } catch {
-    /* no campaign saved yet */
+    /* nothing saved yet */
   }
 }
 
@@ -136,16 +128,16 @@ async function saveState() {
   try {
     const { writeFile, rename } = await import('node:fs/promises');
     const tmp = `${stateFile}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify([...campaigns.values()]), { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify({ usage: Object.fromEntries(usage) }), { mode: 0o600 });
     await rename(tmp, stateFile);
   } catch {
-    /* the campaigns still run in memory */
+    /* limits still work in memory */
   }
 }
 
 /**
- * Starts (or replaces) the campaign of `ownerId` on the channel behind `link`.
- * @returns {Promise<{ok:true, campaign:object}|{ok:false, reason:'invalid_link'|'not_found'|'full'}>}
+ * Checks the limits and reserves one burst of 10 reactions for `ownerId` on the channel behind `link`.
+ * @returns {Promise<{ok:true, campaign:object}|{ok:false, reason:'invalid_link'|'not_found'|'cooldown'|'daily', waitMs?:number}>}
  */
 export async function startBoost(sock, link, ownerId) {
   const id = String(ownerId);
@@ -158,29 +150,44 @@ export async function startBoost(sock, link, ownerId) {
     meta = null;
   }
   if (!meta?.id || !String(meta.id).endsWith('@newsletter')) return { ok: false, reason: 'not_found' };
-  sweep();
-  if (!campaigns.has(id) && campaigns.size >= MAX_CAMPAIGNS) return { ok: false, reason: 'full' };
+
+  const now = Date.now();
+  const rec = currentUsage(id, now);
+  const last = rec?.links[meta.id];
+  if (last && now - last < SAME_LINK_COOLDOWN_MS) {
+    return { ok: false, reason: 'cooldown', waitMs: last + SAME_LINK_COOLDOWN_MS - now };
+  }
+  if (rec && last == null && Object.keys(rec.links).length >= DAILY_CHANNELS) {
+    return { ok: false, reason: 'daily', waitMs: rec.windowStart + DAY_MS - now };
+  }
+  const entry = rec || { windowStart: now, links: {} };
+  const prevAt = last ?? null;
+  entry.links[meta.id] = now;
+  usage.set(id, entry);
+  await saveState();
+
   const campaign = {
     ownerId: id,
     jid: meta.id,
     name: String(meta.name || meta.thread_metadata?.name?.text || '').slice(0, 80),
     url: `https://whatsapp.com/channel/${code}`,
     emojis: pickEmojis(),
-    until: Date.now() + BOOST_MS,
+    prevAt,
   };
-  campaigns.set(id, campaign); // replaces the previous channel of this user
-  await saveState();
-  for (const refresh of refreshers) refresh(campaign); // sessions follow the new channel and react to its latest posts
+  for (const refresh of refreshers) refresh(campaign); // the other connected sessions follow the channel and react too
   return { ok: true, campaign: { ...campaign } };
 }
 
-export function stopBoost(ownerId) {
-  const had = campaigns.delete(String(ownerId));
-  if (had) saveState().catch(() => {});
-  return had;
+/** Gives the burst back when nothing could be sent (so a failed try does not use up the day). */
+export async function releaseBoost(ownerId, jid, prevAt = null) {
+  const rec = usage.get(String(ownerId));
+  if (!rec) return;
+  if (prevAt) rec.links[jid] = prevAt;
+  else delete rec.links[jid];
+  if (!Object.keys(rec.links).length) usage.delete(String(ownerId));
+  await saveState();
 }
 
-const posts = new Map(); // "jid:serverId" -> state (campaign channels)
 const brandPosts = new Map(); // "jid:serverId" -> state (brand channel)
 const MAX_TRACKED = 300;
 const trim = (map) => { if (map.size > MAX_TRACKED) map.delete(map.keys().next().value); };
@@ -217,38 +224,6 @@ function handleBrandPost(socket, message, log) {
   timer.unref?.();
 }
 
-/** Campaign channel (.channelreact): every enabled session reacts once, emojis spread over the 10 of the campaign. */
-export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
-  sweep();
-  const c = byJid().get(jid);
-  if (!c) return;
-  const serverId = postId(message);
-  if (!serverId || !fresh(message)) return;
-  const key = `${jid}:${serverId}`;
-  let st = posts.get(key);
-  if (!st) {
-    st = { claimed: 0, emojis: shuffle(c.emojis), sessions: new Set() };
-    posts.set(key, st);
-    trim(posts);
-  }
-  const me = sessionId(socket);
-  if (st.sessions.has(me)) return; // one reaction per session per post
-  st.sessions.add(me);
-  if (typeof isEnabled === 'function' && !isEnabled()) return;
-
-  const slot = st.claimed++;
-  const emoji = st.emojis[slot % st.emojis.length];
-  const timer = setTimeout(async () => {
-    if (Date.now() >= c.until) return;
-    try {
-      await socket.newsletterReactMessage(jid, String(serverId), emoji);
-    } catch (e) {
-      log('warn', 'channel react failed', { err: String(e?.message || e).slice(0, 60) });
-    }
-  }, Math.min(slot * 150, 40_000) + Math.floor(Math.random() * 1500));
-  timer.unref?.();
-}
-
 /** Latest post ids of a channel. Baileys changed the signature between versions, so both are tried. */
 async function latestPostIds(socket, jid, count, log) {
   if (typeof socket.newsletterFetchMessages !== 'function') return [];
@@ -270,7 +245,7 @@ async function latestPostIds(socket, jid, count, log) {
 }
 
 /**
- * This session reacts to the latest posts of a campaign channel (up to 10, one different emoji each).
+ * This session reacts to the latest posts of a channel (up to 10, one different emoji each).
  * It needs no other session: one account = one reaction per post, so 10 reactions = the 10 latest posts.
  * @returns {Promise<{sent:number, posts:number}>}
  */
@@ -279,8 +254,7 @@ export async function reactLatest(socket, c, log = () => {}) {
   const offset = Math.floor(Math.random() * c.emojis.length);
   let sent = 0;
   for (const [i, id] of ids.entries()) {
-    if (Date.now() >= c.until) break;
-    if (i) await new Promise((r) => setTimeout(r, 1200 + Math.floor(Math.random() * 1300)));
+    if (i) await new Promise((r) => setTimeout(r, 400 + Math.floor(Math.random() * 500)));
     try {
       await socket.newsletterReactMessage(c.jid, id, c.emojis[(i + offset) % c.emojis.length]);
       sent++;
@@ -292,7 +266,7 @@ export async function reactLatest(socket, c, log = () => {}) {
 }
 
 /**
- * Attaches the reactions to one socket: brand channel (always) + campaign channels (when isEnabled()).
+ * Attaches the reactions to one socket: brand channel (always) + the one-time bursts of .channelreact (when isEnabled()).
  * Returns dispose() — call it when the socket is closed.
  */
 export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFile: file } = {}) {
@@ -308,7 +282,6 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
       if (!jid || !String(jid).endsWith('@newsletter')) continue;
       try {
         if (jid === channel.jid) handleBrandPost(socket, message, log);
-        else handlePost(socket, message, jid, isEnabled, log);
       } catch (e) {
         log('warn', 'channel reaction error', { err: String(e?.message || e).slice(0, 60) });
       }
@@ -331,8 +304,6 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
     await ready;
     await resolveChannel(socket);
     await follow(channel.jid); // brand channel: every connected session joins it automatically
-    if (!enabled()) return;
-    for (const c of activeCampaigns()) await follow(c.jid);
   };
 
   const onConn = ({ connection }) => {
@@ -347,7 +318,11 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
 
   const refresh = (campaign) => {
     subscribe()
-      .then(() => (campaign && enabled() && campaign.ownerId !== sessionId(socket) ? reactLatest(socket, campaign, log) : undefined))
+      .then(async () => {
+        if (!campaign || !enabled() || campaign.ownerId === sessionId(socket)) return undefined;
+        await follow(campaign.jid);
+        return reactLatest(socket, campaign, log);
+      })
       .catch(() => {});
   };
   refreshers.add(refresh);
