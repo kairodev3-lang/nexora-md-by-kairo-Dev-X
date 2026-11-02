@@ -9,7 +9,7 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, reactLatest } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, releaseBoost, boostStatus, reactLatest } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
 export { isPublicHttps };
 
@@ -58,7 +58,7 @@ const INFO = {
   autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
   autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
   autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
-  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Gives your channel 10 reactions for 5 days; your account also reacts to the other channels.' },
+  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Sends 10 reactions to your channel at once. 1 channel per day; same link again after 30 min.' },
 };
 
 const CMD_ALIASES = {
@@ -545,21 +545,21 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   }
 
   /* ───────── .channelreact [on|off|<channel link>] ───────── */
-  // Each user turns it ON and gives THEIR channel link: for 5 days every connected account reacts to the new posts of
-  // that channel (10 different emojis) and to its 10 latest posts. The link can be changed any time, and redone after 5 days.
+  // Each user turns it ON and gives THEIR channel link: 10 reactions (10 different emojis) are sent at once on the 10
+  // latest posts. Limits: 1 channel per day per user, and the same link can be redone only after 30 minutes.
   const CHANNEL_LINK = /https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+/i;
   let awaitingLinkUntil = 0;
   const myId = () => num(sock.user?.id);
   const timeLeft = (ms) => {
-    const h = Math.max(0, Math.floor(ms / 3_600_000));
-    return `${Math.floor(h / 24)}d ${h % 24}h`;
+    const m = Math.max(1, Math.ceil(ms / 60_000));
+    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}min` : `${m} min`;
   };
 
   function boostLines() {
-    const c = campaignOf(myId());
+    const st = boostStatus(myId());
     const lines = [`React : *${settings.channelreact ? 'ON' : 'OFF'}*`];
-    if (c) lines.push(`Your channel : *${c.name || '—'}*`, c.url, `Emojis : ${c.emojis.join(' ')}`, `Time left : *${timeLeft(c.until - Date.now())}*`);
-    else lines.push('Your channel : *none yet*');
+    if (st) lines.push(`Channels used today : *${st.channels}/1*`, `New day in : *${timeLeft(st.windowEnd - Date.now())}*`);
+    else lines.push('Today : *no channel used yet*');
     return lines;
   }
 
@@ -572,7 +572,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     await reply(box('🔎 CHANNEL REACT', ['Checking the channel…']));
     const r = await startBoost(sock, link, myId());
     if (!r.ok) {
-      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are running right now. Try again later.' }[r.reason];
+      if (r.reason === 'cooldown') return reply(box('⏳ CHANNEL REACT', ['This channel already got its reactions.', `Wait *${timeLeft(r.waitMs)}* before sending the same link again.`]));
+      if (r.reason === 'daily') return reply(box('⏳ CHANNEL REACT', ['You already used your channel for today (1 channel per day).', `Next one in *${timeLeft(r.waitMs)}*.`, 'The same channel can be redone every 30 min.']));
+      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.' }[r.reason];
       return reply(box('❌ CHANNEL REACT', [why, 'Example : https://whatsapp.com/channel/XXXX']));
     }
     try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
@@ -582,12 +584,13 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       `Emojis : ${r.campaign.emojis.join(' ')}`,
       'Sending your 10 reactions…',
     ]));
-    // Works with ONE connected user: this very account reacts to the 10 latest posts (other accounts only add more).
+    // This very account reacts to the 10 latest posts, all at once (other connected accounts only add more).
     try { await sock.newsletterFollow?.(r.campaign.jid); } catch { /* already following */ }
     const res = await reactLatest(sock, r.campaign, log);
+    if (!res.sent) await releaseBoost(myId(), r.campaign.jid, r.campaign.prevAt); // failed try does not use up the day
     const lines = res.sent
-      ? [`Reactions sent : *${res.sent}/10*`, 'New posts : reacted automatically for *5 days*, then it stops.', `Change channel : *${P()}channelreact <new link>*`]
-      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'New posts will still be reacted to for 5 days.'];
+      ? [`Reactions sent : *${res.sent}/10*`, 'One-time send : no automatic reactions afterwards.', `Same link again : in *30 min*`]
+      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'Nothing was counted: you can try again.'];
     return reply(box(res.sent ? '✅ CHANNEL REACT' : '⚠️ CHANNEL REACT', lines));
   }
 
@@ -598,9 +601,8 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (['off', 'false', '0'].includes(v)) {
       settings.channelreact = false;
       await saveSettings(authDir, settings);
-      stopBoost(myId());
       try { onSettingChange('channelreact', false); } catch { /* never block a setting */ }
-      return reply(box('📣 CHANNEL REACT', ['React : *OFF* ✅', 'Your account no longer reacts and your channel campaign is stopped.']));
+      return reply(box('📣 CHANNEL REACT', ['React : *OFF* ✅', 'Your account no longer reacts to channels.']));
     }
     if (['on', 'true', '1'].includes(v) || !v) {
       if (!settings.channelreact) {
