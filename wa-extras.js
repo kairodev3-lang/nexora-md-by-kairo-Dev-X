@@ -9,7 +9,7 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, releaseBoost, boostStatus, reactLatest } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, reactLatest, autoFollowers } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
 export { isPublicHttps };
 
@@ -58,7 +58,7 @@ const INFO = {
   autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
   autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
   autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
-  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Sends 10 reactions to your channel at once. 1 channel per day; same link again after 30 min.' },
+  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Gives your channel 10 reactions for 5 days; your account also reacts to the other channels.' },
 };
 
 const CMD_ALIASES = {
@@ -71,12 +71,13 @@ const CMD_ALIASES = {
   instagram: 'ig', igdl: 'ig', insta: 'ig',
   tiktok: 'tt', tiktokdl: 'tt',
   mf: 'mediafire',
+  autofollower: 'autofollowers', followers: 'autofollowers', af: 'autofollowers',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
-  'tt', 'fc', 'ig', 'mediafire',
+  'tt', 'fc', 'ig', 'mediafire', 'autofollowers',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
@@ -545,21 +546,22 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   }
 
   /* ───────── .channelreact [on|off|<channel link>] ───────── */
-  // Each user turns it ON and gives THEIR channel link: 10 reactions (10 different emojis) are sent at once on the 10
-  // latest posts. Limits: 1 channel per day per user, and the same link can be redone only after 30 minutes.
+  // Each user turns it ON and gives THEIR channel link: for 5 days every connected account reacts to the new posts of
+  // that channel (10 different emojis) and to its 10 latest posts. The link can be changed any time, and redone after 5 days.
   const CHANNEL_LINK = /https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+/i;
   let awaitingLinkUntil = 0;
+  let awaitingKind = 'react'; // what the next channel link is for: 'react' | 'follow'
   const myId = () => num(sock.user?.id);
   const timeLeft = (ms) => {
-    const m = Math.max(1, Math.ceil(ms / 60_000));
-    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}min` : `${m} min`;
+    const h = Math.max(0, Math.floor(ms / 3_600_000));
+    return `${Math.floor(h / 24)}d ${h % 24}h`;
   };
 
   function boostLines() {
-    const st = boostStatus(myId());
+    const c = campaignOf(myId());
     const lines = [`React : *${settings.channelreact ? 'ON' : 'OFF'}*`];
-    if (st) lines.push(`Channels used today : *${st.channels}/1*`, `New day in : *${timeLeft(st.windowEnd - Date.now())}*`);
-    else lines.push('Today : *no channel used yet*');
+    if (c) lines.push(`Your channel : *${c.name || '—'}*`, c.url, `Emojis : ${c.emojis.join(' ')}`, `Time left : *${timeLeft(c.until - Date.now())}*`);
+    else lines.push('Your channel : *none yet*');
     return lines;
   }
 
@@ -572,9 +574,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     await reply(box('🔎 CHANNEL REACT', ['Checking the channel…']));
     const r = await startBoost(sock, link, myId());
     if (!r.ok) {
-      if (r.reason === 'cooldown') return reply(box('⏳ CHANNEL REACT', ['This channel already got its reactions.', `Wait *${timeLeft(r.waitMs)}* before sending the same link again.`]));
-      if (r.reason === 'daily') return reply(box('⏳ CHANNEL REACT', ['You already used your channel for today (1 channel per day).', `Next one in *${timeLeft(r.waitMs)}*.`, 'The same channel can be redone every 30 min.']));
-      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.' }[r.reason];
+      const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are running right now. Try again later.' }[r.reason];
       return reply(box('❌ CHANNEL REACT', [why, 'Example : https://whatsapp.com/channel/XXXX']));
     }
     try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
@@ -584,13 +584,12 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       `Emojis : ${r.campaign.emojis.join(' ')}`,
       'Sending your 10 reactions…',
     ]));
-    // This very account reacts to the 10 latest posts, all at once (other connected accounts only add more).
+    // Works with ONE connected user: this very account reacts to the 10 latest posts (other accounts only add more).
     try { await sock.newsletterFollow?.(r.campaign.jid); } catch { /* already following */ }
     const res = await reactLatest(sock, r.campaign, log);
-    if (!res.sent) await releaseBoost(myId(), r.campaign.jid, r.campaign.prevAt); // failed try does not use up the day
     const lines = res.sent
-      ? [`Reactions sent : *${res.sent}/10*`, 'One-time send : no automatic reactions afterwards.', `Same link again : in *30 min*`]
-      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'Nothing was counted: you can try again.'];
+      ? [`Reactions sent : *${res.sent}/10*`, 'New posts : reacted automatically for *5 days*, then it stops.', `Change channel : *${P()}channelreact <new link>*`]
+      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'New posts will still be reacted to for 5 days.'];
     return reply(box(res.sent ? '✅ CHANNEL REACT' : '⚠️ CHANNEL REACT', lines));
   }
 
@@ -601,8 +600,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (['off', 'false', '0'].includes(v)) {
       settings.channelreact = false;
       await saveSettings(authDir, settings);
+      stopBoost(myId());
       try { onSettingChange('channelreact', false); } catch { /* never block a setting */ }
-      return reply(box('📣 CHANNEL REACT', ['React : *OFF* ✅', 'Your account no longer reacts to channels.']));
+      return reply(box('📣 CHANNEL REACT', ['React : *OFF* ✅', 'Your account no longer reacts and your channel campaign is stopped.']));
     }
     if (['on', 'true', '1'].includes(v) || !v) {
       if (!settings.channelreact) {
@@ -611,6 +611,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
         try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
       }
       awaitingLinkUntil = Date.now() + 3 * 60_000;
+      awaitingKind = 'react';
       const lines = boostLines();
       lines.push('📎 Send your channel link now.', `(or *${P()}channelreact <link>*)`, `Stop : *${P()}channelreact off*`);
       return reply(box('📣 CHANNEL REACT', lines));
@@ -623,8 +624,39 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (Date.now() > awaitingLinkUntil) return false;
     const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)\/?$/i);
     if (!hit) return false;
-    await applyBoostLink(hit[1], reply);
+    if (awaitingKind === 'follow') await applyFollowers(hit[1], reply);
+    else await applyBoostLink(hit[1], reply);
     return true;
+  }
+
+  /* ───────── .autofollowers <channel link> : 10 connected accounts follow your channel ───────── */
+  async function applyFollowers(link, reply) {
+    awaitingLinkUntil = 0;
+    await reply(box('👥 AUTOFOLLOWERS', ['Checking the channel…']));
+    const r = await autoFollowers(sock, link, myId(), log);
+    if (!r.ok) {
+      const why = {
+        invalid_link: 'Invalid channel link.',
+        not_found: 'Channel not found.',
+        no_sessions: 'No other connected account is available right now.',
+        cooldown: `One request per day. Try again in ${timeLeft(r.waitMs || 0)}.`,
+      }[r.reason] || 'Failed.';
+      return reply(box('❌ AUTOFOLLOWERS', [why]));
+    }
+    return reply(box(r.done ? '👥 AUTOFOLLOWERS ✅' : '❌ AUTOFOLLOWERS', [
+      `Channel : *${r.name || '—'}*`,
+      r.url,
+      `New followers : *${r.done}/${r.asked}*`,
+      r.done < 10 ? 'Fewer than 10 accounts were available (or some follows failed).' : 'Done!',
+    ]));
+  }
+
+  async function autoFollowersCmd(args, { reply }) {
+    const link = args.find((a) => CHANNEL_LINK.test(a));
+    if (link) return applyFollowers(link.match(CHANNEL_LINK)[0], reply);
+    awaitingLinkUntil = Date.now() + 3 * 60_000;
+    awaitingKind = 'follow';
+    return reply(box('👥 AUTOFOLLOWERS', ['10 accounts connected to the bot will follow your channel.', '📎 Send your channel link now.', `(or *${P()}autofollowers <link>*)`, 'Limit : 1 request per day.']));
   }
 
   /* ───────── .fancy ───────── */
@@ -728,6 +760,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (Object.hasOwn(social, name)) return await social[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'fancy') return await fancy(q, reply);
       if (name === 'channelreact') return await channelBoostCmd(args, { reply });
+      if (name === 'autofollowers') return await autoFollowersCmd(args, { reply });
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
