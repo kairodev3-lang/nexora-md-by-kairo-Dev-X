@@ -20,7 +20,7 @@ export const SECTIONS = [
   { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'mediafire', 'song', 'video', 'tt', 'fc', 'ig', 'twitter', 'pinterest', 'telegram'] },
   { icon: '🧸', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
   { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
-  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'pair', 'depair'] },
+  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'autofollowers', 'pair', 'depair'] },
   {
     icon: '⚙️',
     title: 'SETTINGS',
