@@ -1,11 +1,12 @@
-// Minimal HTTP API (node:http, zero dependency) called by Telebot Creator.
+// API HTTP minimale (node:http, zéro dépendance) appelée par Telebot Creator.
 //
 //   GET  /health                public — { ok, uptime_s }
 //   POST /v1/connect            { tg_id, phone }  -> { status:'pairing', code, expires_in } | { status:'already_connected' }
 //   GET  /v1/status?tg_id=...   -> { state, phone (masqué), connected_since }
+//   GET  /v1/stats              -> { total_sessions, connected_sessions }
 //   POST /v1/disconnect         { tg_id }         -> { found }
 //
-// All /v1 routes require the x-api-key header.
+// Toutes les routes /v1 exigent l'en-tête  x-api-key.
 
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -34,16 +35,16 @@ function readJson(req) {
         if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('not object');
         resolve(v);
       } catch {
-        reject(new ApiError('BAD_JSON', 400, 'Invalid JSON body.'));
+        reject(new ApiError('BAD_JSON', 400, 'Corps JSON invalide.'));
       }
     });
     req.on('error', () => reject(new ApiError('BAD_REQUEST', 400, 'Invalid request.')));
   });
 }
 
-export function createHttpServer({ config, manager, logger, notifier = null, startedAt = Date.now() }) {
+export function createHttpServer({ config, manager, logger, startedAt = Date.now() }) {
   const apiHash = sha(config.apiKey);
-  const connectLimiter = new RateLimiter(3, 10 * 60_000); // 3 code requests / 10 min / user
+  const connectLimiter = new RateLimiter(3, 10 * 60_000); // 3 demandes de code / 10 min / utilisateur
   const globalLimiter = new RateLimiter(300, 60_000);
 
   const authOk = (req) => {
@@ -64,13 +65,10 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
   };
 
   async function route(req, res, url) {
-    if (req.method === 'GET' && url.pathname === '/') {
-      return send(res, 200, { ok: true, name: 'NEXORA MD', status: 'online' });
-    }
     if (req.method === 'GET' && url.pathname === '/health') {
       return send(res, 200, { ok: true, uptime_s: Math.floor((Date.now() - startedAt) / 1000) });
     }
-    if (!url.pathname.startsWith('/v1/')) throw new ApiError('NOT_FOUND', 404, 'Unknown route.');
+    if (!url.pathname.startsWith('/v1/')) throw new ApiError('NOT_FOUND', 404, 'Route inconnue.');
 
     if (!authOk(req)) throw new ApiError('UNAUTHORIZED', 401, 'Invalid API key.');
     const g = globalLimiter.hit('all');
@@ -85,26 +83,17 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
           retry_after: lim.retryAfterSec,
         });
       }
-      const result = await manager.connect(body.tg_id, body.phone);
-      let delivered = false;
-      if (result.status === 'pairing' && result.code && notifier?.enabled && notifier.sendTemp) {
-        const html =
-          '🔐 <b>PAIRING CODE</b>\n━━━━━━━━━━━━━━━━━━━━\n\n' +
-          '<code>' + result.code + '</code>\n<i>(tap the code to copy it)</i>\n\n' +
-          '1️⃣ Open <b>WhatsApp</b> on the phone of number +' + String(result.phone || '').replace('+', '') + '\n' +
-          '2️⃣ <b>Settings → Linked devices → Link a device</b>\n' +
-          '3️⃣ Choose <b>"Link with phone number instead"</b>\n' +
-          '4️⃣ Enter the code above\n\n' +
-          '⏳ This message deletes itself in 10 minutes. If WhatsApp rejects the code, run <code>.connect</code> again.\n' +
-          '🔒 Never share this code with anyone.';
-        delivered = await notifier.sendTemp(body.tg_id, html, 10 * 60_000);
-      }
-      return send(res, 200, { ok: true, ...result, delivered });
+      return send(res, 200, { ok: true, ...(await manager.connect(body.tg_id, body.phone)) });
     }
 
     if (url.pathname === '/v1/status') {
       if (req.method !== 'GET') throw new ApiError('METHOD', 405, 'Method not allowed.');
       return send(res, 200, { ok: true, ...manager.status(url.searchParams.get('tg_id')) });
+    }
+
+    if (url.pathname === '/v1/stats') {
+      if (req.method !== 'GET') throw new ApiError('METHOD', 405, 'Method not allowed.');
+      return send(res, 200, { ok: true, ...manager.stats() });
     }
 
     if (url.pathname === '/v1/disconnect') {
@@ -113,7 +102,7 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
       return send(res, 200, { ok: true, ...(await manager.disconnect(body.tg_id)) });
     }
 
-    throw new ApiError('NOT_FOUND', 404, 'Unknown route.');
+    throw new ApiError('NOT_FOUND', 404, 'Route inconnue.');
   }
 
   return http.createServer(async (req, res) => {
@@ -130,10 +119,10 @@ export function createHttpServer({ config, manager, logger, notifier = null, sta
         send(res, err.status, { ok: false, error: { code: err.code, message: err.message, ...err.extra } }, headers);
       } else {
         logger.error('unhandled', { err: err?.message });
-        send(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'Internal error.' } });
+        send(res, 500, { ok: false, error: { code: 'INTERNAL', message: 'Erreur interne.' } });
       }
     } finally {
-      // never log a body, number, code or key
+      // jamais de corps, de numéro, de code ni de clé dans les logs
       logger.info('http', { method: req.method, path: (req.url || '').split('?')[0], status, ms: Date.now() - t0 });
     }
   });
