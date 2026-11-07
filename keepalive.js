@@ -1,6 +1,6 @@
 // Keep-alive: stops free hosts (Render, Koyeb, Replit, Railway trial…) from putting the bot to sleep
 // after a few minutes without HTTP traffic. Pings /health on the local server and on the public URL
-// of the deployment (auto-detected, or set KEEPALIVE_URL). KEEPALIVE_SEC changes the delay (default 240 s).
+// of the deployment (auto-detected, or set KEEPALIVE_URL). KEEPALIVE_SEC changes the delay (default 60 s).
 
 const publicUrl = (env = process.env) => {
   const direct = env.KEEPALIVE_URL || env.RENDER_EXTERNAL_URL || env.APP_URL || env.PUBLIC_URL;
@@ -23,7 +23,7 @@ export function startKeepAlive({ port, logger, env = process.env, fetchImpl = gl
     }
   }
   const sec = Number.parseInt(env.KEEPALIVE_SEC ?? '', 10);
-  const everyMs = (Number.isFinite(sec) && sec >= 30 ? sec : 240) * 1000;
+  const everyMs = (Number.isFinite(sec) && sec >= 20 ? sec : 60) * 1000;
   const tick = () => {
     for (const url of targets) fetchImpl(url, { signal: AbortSignal.timeout(15_000) }).catch(() => {});
   };
