@@ -226,7 +226,8 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
     react(jid, m, '⏳');
     let video;
     try {
-      video = (await yts(q)).videos?.[0];
+      const vid = youtubeId(q);
+      video = vid ? await yts({ videoId: vid }) : (await yts(q)).videos?.[0];
     } catch {
       react(jid, m, '❌');
       return reply(box('❌ SONG', ['Search failed.']));
