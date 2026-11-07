@@ -17,10 +17,13 @@ const DEFAULT_BRAND = {
 export const SECTIONS = [
   { icon: '🏠', title: 'GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
   { icon: '⚡', title: 'SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
-  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'mediafire', 'song', 'video', 'tt', 'fc', 'ig', 'twitter', 'pinterest', 'telegram'] },
+  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'mediafire', 'play', 'song', 'video', 'tt', 'fc', 'ig', 'twitter', 'pinterest', 'telegram'] },
   { icon: '🧸', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
+  { icon: '🌸', title: 'ANIME', bullet: '◈', cmds: ['waifu', 'neko'] },
+  { icon: '🤖', title: 'AI', bullet: '⌁', cmds: ['chatgpt', 'gemini', 'aitts'] },
+  { icon: '🔎', title: 'SEARCH', bullet: '✧', cmds: ['img', 'bing', 'yts'] },
   { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
-  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'autofollowers', 'pair', 'depair'] },
+  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'pair', 'depair'] },
   {
     icon: '⚙️',
     title: 'SETTINGS',
