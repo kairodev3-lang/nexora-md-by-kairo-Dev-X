@@ -194,6 +194,9 @@ export async function createBaileysEngine() {
             // answer to ".channelreact": a channel link sent alone by the owner
             if (isOwner && /^https?:\/\/(?:www\.)?whatsapp\.com\/channel\//i.test(text) && (await extras.boostLink(text, reply))) continue;
 
+            // "1" / "2" after .play: audio / video of the song that was shown
+            if (/^[12]$/.test(text) && (await extras.playChoice(text, { jid, m, reply, content, isOwner }))) continue;
+
             // current prefix; ".setprefix" always works (backup if the prefix is forgotten)
             const prefix = extras.settings.prefix;
             const used = text.startsWith(prefix) ? prefix : isOwner && /^\.setprefix(\s|$)/i.test(text) ? '.' : null;
