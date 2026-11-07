@@ -66,20 +66,50 @@ export async function createBaileysEngine() {
   });
 
   /** content: text (string) or Baileys object. plain = true → no "channel" wrapper (media, files). */
-  const sendMsg = async (sock, jid, content, quoted, plain = false) => {
+  const sendMsg = async (sock, jid, content, quoted, plain = false, sentCache = null) => {
     const opts = quoted ? { quoted } : undefined;
     let msg = typeof content === 'string' ? { text: content } : { ...content };
     if (menuImage && typeof content === 'string' && isMenuText(content) && content.length <= 3500) {
       msg = { image: menuImage, caption: content };
     }
     // stickers, reactions, deletions and edits go out as they are; everything else carries the channel wrapper
-    if (plain && (msg.sticker || msg.react || msg.delete || msg.edit)) return sock.sendMessage(jid, msg, opts);
+    // Every sent message is remembered for a while: WhatsApp asks for it again when the receiver could not decrypt it
+    // (typical in DMs). Without it the person sees "Waiting for this message…" and the reply never shows up.
+    const remember = (sent) => {
+      try {
+        if (sentCache && sent?.key?.id && sent.message) {
+          sentCache.set(sent.key.id, sent.message);
+          if (sentCache.size > 400) sentCache.delete(sentCache.keys().next().value);
+        }
+      } catch { /* cache is best effort */ }
+      return sent;
+    };
+    if (plain && (msg.sticker || msg.react || msg.delete || msg.edit)) return remember(await sock.sendMessage(jid, msg, opts));
     try {
-      return await sock.sendMessage(jid, { ...msg, contextInfo: { ...(msg.contextInfo || {}), ...forwardedCtx() } }, opts);
+      return remember(await sock.sendMessage(jid, { ...msg, contextInfo: { ...(msg.contextInfo || {}), ...forwardedCtx() } }, opts));
     } catch (e) {
       log('warn', 'send with channel wrapper refused, retrying plain', { err: e?.message || 'error' });
-      return sock.sendMessage(jid, msg, opts);
+      return remember(await sock.sendMessage(jid, msg, opts));
     }
+  };
+
+  /** Tiny TTL cache with the interface Baileys expects (get / set / del / flushAll). */
+  const makeRetryCache = (ttlMs = 10 * 60_000) => {
+    const m = new Map();
+    return {
+      get: (k) => {
+        const v = m.get(k);
+        if (!v) return undefined;
+        if (Date.now() > v.until) { m.delete(k); return undefined; }
+        return v.value;
+      },
+      set: (k, value) => {
+        m.set(k, { value, until: Date.now() + ttlMs });
+        if (m.size > 2000) m.delete(m.keys().next().value);
+      },
+      del: (k) => { m.delete(k); },
+      flushAll: () => m.clear(),
+    };
   };
 
   return {
@@ -93,6 +123,7 @@ export async function createBaileysEngine() {
         /* keep the library's default version */
       }
 
+      const sentCache = new Map(); // message id -> message content (for getMessage)
       const sock = makeWASocket({
         ...(version ? { version } : {}),
         logger,
@@ -111,10 +142,11 @@ export async function createBaileysEngine() {
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         generateHighQualityLinkPreview: false,
-        getMessage: async () => undefined,
+        msgRetryCounterCache: makeRetryCache(),
+        getMessage: async (key) => sentCache.get(key?.id) || undefined,
       });
 
-      const send = (jid, content, quoted, plain) => sendMsg(sock, jid, content, quoted, plain);
+      const send = (jid, content, quoted, plain) => sendMsg(sock, jid, content, quoted, plain, sentCache);
       let boost = null;
       const extras = await createExtras({
         sock,
@@ -144,7 +176,9 @@ export async function createBaileysEngine() {
 
       sock.ev.on('connection.update', (u) => {
         if (u.connection) log('info', 'wa connection', { connection: u.connection, code: u.lastDisconnect?.error?.output?.statusCode });
-        if (u.qr) readyResolve(); // the socket is ready to request a pairing code
+        // the socket is ready to request a pairing code: QR emitted, or the connection has started (+ short pause)
+        if (u.qr) readyResolve();
+        if (u.connection === 'connecting') setTimeout(readyResolve, 2500);
         if (u.connection === 'open') onEvent({ type: 'open' });
         if (u.connection === 'close') {
           const code = u.lastDisconnect?.error?.output?.statusCode;
@@ -170,10 +204,16 @@ export async function createBaileysEngine() {
         if (!onCommand) return;
         for (const m of messages || []) {
           try {
-            if (!m.message) continue;
+            if (!m.message) {
+              // could not be decrypted (yet): WhatsApp retries by itself, we only log it
+              if (!m.key?.fromMe && m.messageStubType) log('warn', 'wa message not decrypted', { stub: m.messageStubType, dm: !String(m.key?.remoteJid || '').endsWith('@g.us') });
+              continue;
+            }
             const isOwner = Boolean(m.key?.fromMe);
             if (!isOwner) {
-              await extras.onIncoming(m, type); // metadata only (read, presence, statuses)
+              try {
+                await extras.onIncoming(m, type); // metadata only (read, presence, statuses)
+              } catch { /* never stop a command because of auto-read / presence */ }
               if (extras.settings.mode !== 'public' || type !== 'notify') continue; // private mode: stop here
             }
             const jid = m.key.remoteJid;
@@ -260,10 +300,22 @@ export async function createBaileysEngine() {
           }
         },
         async requestPairingCode(phone) {
-          await Promise.race([ready, new Promise((r) => setTimeout(r, 5000))]);
+          await Promise.race([ready, new Promise((r) => setTimeout(r, 12_000))]);
           if (sock.authState.creds.registered) throw new Error('already registered');
-          const raw = await sock.requestPairingCode(phone);
-          return String(raw).match(/.{1,4}/g)?.join('-') ?? String(raw);
+          const digits = String(phone).replace(/\D/g, '');
+          let lastErr;
+          // WhatsApp sometimes refuses the first request while the socket is still opening: retry a few times
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const raw = await sock.requestPairingCode(digits);
+              return String(raw).match(/.{1,4}/g)?.join('-') ?? String(raw);
+            } catch (e) {
+              lastErr = e;
+              log('warn', 'pairing code request failed', { attempt, err: String(e?.message || e).slice(0, 80) });
+              await new Promise((r) => setTimeout(r, 1500 + attempt * 1500));
+            }
+          }
+          throw lastErr || new Error('pairing failed');
         },
         async logout() {
           await sock.logout();
