@@ -188,10 +188,18 @@ const followCooldown = new Map(); // ownerId -> timestamp (free followers: once 
 const reactedOn = new Map(); // "jid:postId" -> Set(sessionId) that already reacted
 const FOLLOW_COOLDOWN_MS = ROUND_MS;
 
-/** Other connected accounts (never the owner, never accounts with .channelreact OFF), least used first. */
+const isOnline = (x) => {
+  try {
+    return Boolean(x.open && x.socket?.user && !x.socket.ws?.isClosed && !x.socket.ws?.isClosing);
+  } catch {
+    return Boolean(x.open);
+  }
+};
+
+/** Other connected accounts (never the owner, never accounts with .channelreact OFF, only sockets that are really online), least used first. */
 function pickSessions(ownerId, exclude = new Set(), n = BOOST_SIZE) {
   const pool = shuffle(
-    [...liveSessions.entries()].filter(([sid, x]) => sid !== String(ownerId) && !exclude.has(sid) && (typeof x.isEnabled !== 'function' || x.isEnabled())),
+    [...liveSessions.entries()].filter(([sid, x]) => sid !== String(ownerId) && !exclude.has(sid) && isOnline(x) && (typeof x.isEnabled !== 'function' || x.isEnabled())),
   );
   pool.sort((a, b) => a[1].given - b[1].given); // stable: random order among equal counts
   return pool.slice(0, n);
@@ -199,17 +207,26 @@ function pickSessions(ownerId, exclude = new Set(), n = BOOST_SIZE) {
 
 const pause = (min, spread) => new Promise((res) => setTimeout(res, min + Math.floor(Math.random() * spread)));
 
+const ALREADY = /already|exist|conflict|409|subscribed|follow(ing|ed)/i;
+
 async function followWith(list, jid, log) {
   let done = 0;
   for (const [, x] of list) {
     await pause(800, 1500);
-    try {
-      await x.socket.newsletterFollow(jid);
-      x.given++;
-      done++;
-    } catch (e) {
-      log('warn', 'channel follow failed', { why: String(e?.message || '').slice(0, 50) });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await x.socket.newsletterFollow(jid);
+        x.given++;
+        done++;
+        break;
+      } catch (e) {
+        const why = String(e?.message || e?.output?.payload?.message || e || '').slice(0, 80);
+        if (ALREADY.test(why)) { done++; break; } // that account already follows the channel
+        log('warn', 'channel follow failed', { why, attempt });
+        if (attempt === 0) await pause(1500, 1500);
+      }
     }
+    try { await x.socket.subscribeNewsletterUpdates?.(jid); } catch { /* live updates are optional */ }
   }
   return done;
 }
@@ -222,12 +239,16 @@ async function reactWith(list, jid, post, emojis, log) {
   let sent = 0;
   for (const [i, [sid, x]] of list.entries()) {
     await pause(700, 1300);
-    try {
-      await x.socket.newsletterReactMessage(jid, String(post), emojis[i % emojis.length]);
-      seen.add(sid);
-      sent++;
-    } catch (e) {
-      log('warn', 'channel react failed', { why: String(e?.message || '').slice(0, 50) });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await x.socket.newsletterReactMessage(jid, String(post), emojis[i % emojis.length]);
+        seen.add(sid);
+        sent++;
+        break;
+      } catch (e) {
+        log('warn', 'channel react failed', { why: String(e?.message || e || '').slice(0, 80), attempt });
+        if (attempt === 0) await pause(1500, 1500);
+      }
     }
   }
   return sent;
@@ -376,18 +397,27 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
   timer.unref?.();
 }
 
-/** Latest post ids of a channel. Baileys changed the signature between versions, so both are tried. */
+/** Latest post ids of a channel. Baileys changed the signature between versions, so every known shape is tried. */
 async function latestPostIds(socket, jid, count, log) {
-  if (typeof socket.newsletterFetchMessages !== 'function') return [];
-  const calls = [
-    () => socket.newsletterFetchMessages(jid, count), // newer: (jid, count, since?, after?)
-    () => socket.newsletterFetchMessages('jid', jid, count), // older: (type, key, count, after?)
-  ];
+  const calls = [];
+  if (typeof socket.newsletterFetchMessages === 'function') {
+    calls.push(
+      () => socket.newsletterFetchMessages(jid, count), // newer: (jid, count, since?, after?)
+      () => socket.newsletterFetchMessages('jid', jid, count), // older: (type, key, count, after?)
+      () => socket.newsletterFetchMessages(jid, count, 0),
+    );
+  }
+  if (typeof socket.newsletterFetchUpdates === 'function') {
+    calls.push(() => socket.newsletterFetchUpdates(jid, count));
+  }
+  const idOf = (x) => x?.server_id ?? x?.serverId ?? x?.key?.server_id ?? x?.newsletterServerId ?? x?.id;
   for (const call of calls) {
     try {
       const raw = await call();
-      const list = Array.isArray(raw) ? raw : raw?.messages || raw?.result || [];
-      const ids = [...new Set(list.map((x) => x?.server_id ?? x?.serverId ?? x?.id ?? x?.key?.server_id).filter((x) => x != null && /^\d+$/.test(String(x))).map(String))];
+      const list = Array.isArray(raw) ? raw : raw?.messages || raw?.updates || raw?.result || [];
+      const ids = [...new Set(list.map(idOf).filter((x) => x != null && /^\d+$/.test(String(x))).map(String))];
+      // newest first, whatever the order returned by WhatsApp
+      ids.sort((a, b) => Number(b) - Number(a));
       if (ids.length) return ids.slice(0, count);
     } catch (e) {
       log('warn', 'channel react: fetching latest posts failed', { err: String(e?.message || e).slice(0, 60) });
@@ -434,7 +464,9 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
       const jid = message?.key?.remoteJid;
       if (!jid || !String(jid).endsWith('@newsletter')) continue;
       try {
-        if (jid === channel.jid) handleBrandPost(socket, message, log);
+        if (jid === channel.jid) {
+          if (enabled()) handleBrandPost(socket, message, log); // .channelreact off = this account never reacts
+        }
         else handlePost(socket, message, jid, isEnabled, log);
       } catch (e) {
         log('warn', 'channel reaction error', { err: String(e?.message || e).slice(0, 60) });
@@ -457,12 +489,14 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
     if (disposed) return;
     await ready;
     await resolveChannel(socket);
-    await follow(channel.jid); // brand channel: every connected session joins it automatically
-    if (!enabled()) return;
+    if (!enabled()) return; // .channelreact off: no automatic follow / reaction from this account
+    await follow(channel.jid); // brand channel: connected sessions with .channelreact ON join it
     for (const c of activeCampaigns()) if (c.members?.includes(sessionId(socket))) await follow(c.jid);
   };
 
   const onConn = ({ connection }) => {
+    const live = liveSessions.get(sessionId(socket));
+    if (live && connection) live.open = connection === 'open';
     if (connection === 'open') {
       subscribe().catch(() => {});
       clearInterval(timer);
@@ -477,7 +511,7 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
   };
   startTicker(log);
   refreshers.add(refresh);
-  liveSessions.set(sessionId(socket), { socket, isEnabled, given: liveSessions.get(sessionId(socket))?.given || 0 });
+  liveSessions.set(sessionId(socket), { socket, isEnabled, open: Boolean(socket.user), given: liveSessions.get(sessionId(socket))?.given || 0 });
   socket.ev.on('messages.upsert', onUpsert);
   socket.ev.on('connection.update', onConn);
 
