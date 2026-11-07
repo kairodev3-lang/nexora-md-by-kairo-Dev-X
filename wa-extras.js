@@ -9,8 +9,9 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, reactLatest, autoFollowers } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
+import { createContent } from './wa-content.js';
 export { isPublicHttps };
 
 const SETTINGS_FILE = 'settings.json';
@@ -21,7 +22,7 @@ const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 const MAX_STICKERS = 100; // Telegram packs hold up to 120 stickers
 const DEFAULT_STICKERS = 20;
 const BLOCK_DEFAULT = 5;
-const BLOCK_MAX = 500;
+const BLOCK_MAX = 600;
 const BLOCK_GAP_MS = 2000; // pause between two block / unblock calls (WhatsApp rate limits)
 const TG_PROGRESS_FILE = 'tg-progress.json';
 
@@ -71,20 +72,21 @@ const CMD_ALIASES = {
   instagram: 'ig', igdl: 'ig', insta: 'ig',
   tiktok: 'tt', tiktokdl: 'tt',
   mf: 'mediafire',
-  autofollower: 'autofollowers', followers: 'autofollowers', af: 'autofollowers',
+  gpt: 'chatgpt', ai: 'chatgpt', bg: 'bing', ytsearch: 'yts', ytv: 'video', yta: 'song',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
-  'tt', 'fc', 'ig', 'mediafire', 'autofollowers',
+  'tt', 'fc', 'ig', 'mediafire',
+  'waifu', 'neko', 'chatgpt', 'gemini', 'aitts', 'img', 'bing', 'yts', 'play',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── public mode: what other people may use ───────── */
 // Everything else (settings, unblock, save, pair, telegram, getid, mode…) stays owner-only.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy']);
-const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl']);
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy', 'waifu', 'neko', 'img', 'bing', 'yts', 'play']);
+const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'img', 'play']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
@@ -181,6 +183,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   const brandOwner = () => process.env.OWNER_NAME || 'KAIRO';
   const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
   const social = createSocial({ sock, send, log });
+  const contentCmds = createContent({ sock, send, log, fetchImpl, P, helpers });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
@@ -218,66 +221,86 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     );
   }
 
-  /* ───────── .block <times> <number> : block + unblock a number several times (default 5, max 50) ───────── */
-  // Works from ANY chat: .block 10 +50912345678 — or reply to a message / use it in the person's private chat.
+  /* ───────── .block <times> <number> : block + unblock a number several times (default 5, max 600) ───────── */
+  // Works from ANY chat: .block 5 +50912345678
   let blockBusy = false;
   async function blockCycles(args, { jid, content, reply }) {
     const ci = content?.extendedTextMessage?.contextInfo;
     const ci0 = args.findIndex((a) => /^\d{1,3}$/.test(a)); // 1-3 digits = times
-    const numberText = args.filter((_, k) => k !== ci0).join(' '); // "+509 1234 5678" is accepted too
+    const numberText = args.filter((_, k) => k !== ci0).join(' ').trim(); // "+509 1234 5678" is accepted too
     const digits = numberText.replace(/\D/g, '');
     const phone = /^[+\d\s()-]+$/.test(numberText) && digits.length >= 8 && digits.length <= 15 ? digits : null;
+    const usage = () => reply(box('🚫 BLOCK', [
+      `Usage : *${P()}block <times> <number>*`,
+      `Example : *${P()}block 5 +50943212344*`,
+      `Times : 1 to ${BLOCK_MAX} (default ${BLOCK_DEFAULT})`,
+      'Each time = 1 block then 1 unblock. Ends unblocked.',
+    ]));
+
     let target = null;
+    let alt = null; // same person, other id format (pn / lid)
     if (phone) {
+      if (isSelf(`${phone}@s.whatsapp.net`)) return reply(box('🚫 BLOCK', ['This is your own number.']));
       target = `${phone}@s.whatsapp.net`;
       try {
         const hit = (await sock.onWhatsApp(phone))?.[0];
         if (hit && hit.exists === false) return reply(box('❌ BLOCK', [`+${phone} is not on WhatsApp.`]));
         if (hit?.jid) target = hit.jid;
+        if (hit?.lid && hit.lid !== target) alt = hit.lid;
       } catch {
         /* lookup unavailable: use the number as it is */
       }
+    } else if (numberText) {
+      return reply(box('❌ BLOCK', ['Invalid number.', `Example : *${P()}block 5 +50943212344*`]));
     } else {
-      target = ci?.participant || null; // reply to a message
-      if (!target && /@(s\.whatsapp\.net|lid)$/.test(jid)) target = jid; // private chat
-    }
-    if (!target || isSelf(target)) {
-      return reply(box('🚫 BLOCK', [
-        `Usage : *${P()}block <times> <number>*`,
-        `Example : *${P()}block 10 +50912345678*`,
-        `Times : 1 to ${BLOCK_MAX} (default ${BLOCK_DEFAULT}), e.g. 10, 50 or 500`,
-        'Works in any chat. You can also reply to a message.',
-        'Each time = 1 block then 1 unblock. Ends unblocked.',
-      ]));
+      target = ci?.participant || null; // reply to a message (optional)
+      if (!target && /@(s\.whatsapp\.net|lid)$/.test(jid)) target = jid; // private chat (optional)
+      if (!target || isSelf(target)) return usage();
     }
     if (blockBusy) return reply(box('⏳ BLOCK', ['A block series is already running.']));
-    const asked = Number.parseInt(args.find((a) => /^\d{1,3}$/.test(a)) ?? '', 10); // 1-3 digits = times (a phone number has 8+)
+    const asked = Number.parseInt(args[ci0] ?? '', 10);
     const times = Math.min(BLOCK_MAX, Math.max(1, Number.isFinite(asked) ? asked : BLOCK_DEFAULT));
     const note = asked > BLOCK_MAX ? ` (limit ${BLOCK_MAX})` : '';
-    await send(jid, { text: box('🚫 BLOCK', [`Target : @${num(target)}`, `Times : *${times}*${note}`, `Estimated : ~${Math.ceil((times * 2 * BLOCK_GAP_MS) / 1000)} s`, 'Running…']), mentions: [target] }, null);
+    const say = (title, lines) => send(jid, { text: box(title, lines), mentions: [target] }, null);
+    await say('🚫 BLOCK', [`Target : @${num(target)}`, `Times : *${times}*${note}`, `Estimated : ~${Math.ceil((times * 2 * BLOCK_GAP_MS) / 60_000)} min`, 'Running…']);
+
+    const setBlock = async (action) => {
+      try {
+        await sock.updateBlockStatus(target, action);
+      } catch (e) {
+        if (!alt) throw e;
+        await sock.updateBlockStatus(alt, action); // some accounts only accept the other id format
+        [target, alt] = [alt, target];
+      }
+    };
+    const wait = () => new Promise((res) => setTimeout(res, BLOCK_GAP_MS));
 
     blockBusy = true;
     let done = 0;
-    let failed = false;
+    let failed = null;
     try {
       for (let i = 0; i < times; i++) {
-        await sock.updateBlockStatus(target, 'block');
-        await new Promise((r) => setTimeout(r, BLOCK_GAP_MS));
-        await sock.updateBlockStatus(target, 'unblock');
+        await setBlock('block');
+        if (i === 0 && alt && typeof sock.fetchBlocklist === 'function') {
+          // first cycle: check that WhatsApp really blocked the person, otherwise switch to the other id format
+          const list = await sock.fetchBlocklist().catch(() => null);
+          if (Array.isArray(list) && !list.includes(target) && list.includes(alt)) [target, alt] = [alt, target];
+        }
+        await wait();
+        await setBlock('unblock');
         done++;
-        if (i < times - 1) await new Promise((r) => setTimeout(r, BLOCK_GAP_MS));
+        if (done % 100 === 0 && done < times) await say('⏳ BLOCK', [`Progress : *${done}/${times}*`]);
+        if (i < times - 1) await wait();
       }
     } catch (e) {
-      failed = true;
-      log('warn', 'wa block series failed', { err: String(e?.message || 'error').slice(0, 60) });
+      failed = String(e?.message || 'error').slice(0, 60);
+      log('warn', 'wa block series failed', { err: failed });
       await sock.updateBlockStatus(target, 'unblock').catch(() => {}); // never leave the person blocked
+      if (alt) await sock.updateBlockStatus(alt, 'unblock').catch(() => {});
     } finally {
       blockBusy = false;
     }
-    return send(jid, {
-      text: box(failed ? '⚠️ BLOCK' : '✅ BLOCK', [`Target : @${num(target)}`, `Done : *${done}/${times}*`, failed ? 'Stopped by an error. The person is unblocked.' : 'Finished. The person is unblocked.']),
-      mentions: [target],
-    }, null);
+    return say(failed ? '⚠️ BLOCK' : '✅ BLOCK', [`Target : @${num(target)}`, `Done : *${done}/${times}*`, failed ? `Stopped : ${failed}` : 'Finished ✅', 'The person is unblocked.']);
   }
 
   /* ───────── .unblock ───────── */
@@ -550,7 +573,6 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   // that channel (10 different emojis) and to its 10 latest posts. The link can be changed any time, and redone after 5 days.
   const CHANNEL_LINK = /https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+/i;
   let awaitingLinkUntil = 0;
-  let awaitingKind = 'react'; // what the next channel link is for: 'react' | 'follow'
   const myId = () => num(sock.user?.id);
   const timeLeft = (ms) => {
     const h = Math.max(0, Math.floor(ms / 3_600_000));
@@ -582,15 +604,21 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       `Channel : *${r.campaign.name || '—'}*`,
       r.campaign.url,
       `Emojis : ${r.campaign.emojis.join(' ')}`,
-      'Sending your 10 reactions…',
+      'Sending 20 followers + 20 reactions…',
     ]));
-    // Works with ONE connected user: this very account reacts to the 10 latest posts (other accounts only add more).
-    try { await sock.newsletterFollow?.(r.campaign.jid); } catch { /* already following */ }
-    const res = await reactLatest(sock, r.campaign, log);
-    const lines = res.sent
-      ? [`Reactions sent : *${res.sent}/10*`, 'New posts : reacted automatically for *5 days*, then it stops.', `Change channel : *${P()}channelreact <new link>*`]
-      : ['No reaction could be sent.', 'The channel may have no posts yet, or WhatsApp refused.', 'New posts will still be reacted to for 5 days.'];
-    return reply(box(res.sent ? '✅ CHANNEL REACT' : '⚠️ CHANNEL REACT', lines));
+    // up to 20 other connected accounts follow + react (works with ONE user too: this account reacts to the 10 latest posts)
+    let res = { pool: 0, followers: 0, followersSkipped: false, reacts: 0 };
+    try {
+      res = await giveBoost(sock, r.campaign, log);
+    } catch (e) {
+      log('warn', 'channelreact give failed', { why: String(e?.message || '').slice(0, 60) });
+    }
+    const lines = [`Channel : *${r.campaign.name || '—'}*`];
+    if (res.followers) lines.push(`Followers : *+${res.followers}* 🎁`);
+    else if (res.followersSkipped) lines.push('Free followers : already given today');
+    if (res.reacts) lines.push(`Reactions : *${res.reacts}*`);
+    lines.push('Every day : 20 new reactions, for *5 days*.', 'New posts : reacted automatically.', `Change channel : *${P()}channelreact <new link>*`);
+    return reply(box('✅ CHANNEL REACT', lines));
   }
 
   async function channelBoostCmd(args, { reply }) {
@@ -611,7 +639,6 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
         try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
       }
       awaitingLinkUntil = Date.now() + 3 * 60_000;
-      awaitingKind = 'react';
       const lines = boostLines();
       lines.push('📎 Send your channel link now.', `(or *${P()}channelreact <link>*)`, `Stop : *${P()}channelreact off*`);
       return reply(box('📣 CHANNEL REACT', lines));
@@ -624,39 +651,8 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (Date.now() > awaitingLinkUntil) return false;
     const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)\/?$/i);
     if (!hit) return false;
-    if (awaitingKind === 'follow') await applyFollowers(hit[1], reply);
-    else await applyBoostLink(hit[1], reply);
+    await applyBoostLink(hit[1], reply);
     return true;
-  }
-
-  /* ───────── .autofollowers <channel link> : 10 connected accounts follow your channel ───────── */
-  async function applyFollowers(link, reply) {
-    awaitingLinkUntil = 0;
-    await reply(box('👥 AUTOFOLLOWERS', ['Checking the channel…']));
-    const r = await autoFollowers(sock, link, myId(), log);
-    if (!r.ok) {
-      const why = {
-        invalid_link: 'Invalid channel link.',
-        not_found: 'Channel not found.',
-        no_sessions: 'No other connected account is available right now.',
-        cooldown: `One request per day. Try again in ${timeLeft(r.waitMs || 0)}.`,
-      }[r.reason] || 'Failed.';
-      return reply(box('❌ AUTOFOLLOWERS', [why]));
-    }
-    return reply(box(r.done ? '👥 AUTOFOLLOWERS ✅' : '❌ AUTOFOLLOWERS', [
-      `Channel : *${r.name || '—'}*`,
-      r.url,
-      `New followers : *${r.done}/${r.asked}*`,
-      r.done < 10 ? 'Fewer than 10 accounts were available (or some follows failed).' : 'Done!',
-    ]));
-  }
-
-  async function autoFollowersCmd(args, { reply }) {
-    const link = args.find((a) => CHANNEL_LINK.test(a));
-    if (link) return applyFollowers(link.match(CHANNEL_LINK)[0], reply);
-    awaitingLinkUntil = Date.now() + 3 * 60_000;
-    awaitingKind = 'follow';
-    return reply(box('👥 AUTOFOLLOWERS', ['10 accounts connected to the bot will follow your channel.', '📎 Send your channel link now.', `(or *${P()}autofollowers <link>*)`, 'Limit : 1 request per day.']));
   }
 
   /* ───────── .fancy ───────── */
@@ -758,9 +754,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (name === 'getid') return await getId({ jid, content, reply });
       if (name === 'idch') return await idCh(q, { reply });
       if (Object.hasOwn(social, name)) return await social[name]({ cmd, args, q, jid, m, content, reply });
+      if (Object.hasOwn(contentCmds.handlers, name)) return await contentCmds.handlers[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'fancy') return await fancy(q, reply);
       if (name === 'channelreact') return await channelBoostCmd(args, { reply });
-      if (name === 'autofollowers') return await autoFollowersCmd(args, { reply });
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
@@ -826,5 +822,24 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
+  // "1" (audio) or "2" (video) sent after .play
+  async function playChoice(text, { jid, m, reply, content, isOwner }) {
+    const pick = contentCmds.takePlayChoice(text, jid, m);
+    if (!pick) return false;
+    let g = null;
+    if (!isOwner) {
+      g = guestCheck(pick.name, m.key.participant || jid);
+      if (g.status !== 'ok') return true; // too many requests: stay silent
+    }
+    try {
+      await more[pick.name]({ cmd: pick.name, args: [], q: pick.video.url, jid, m, content: content || {}, reply });
+    } catch (e) {
+      log('warn', 'wa play choice failed', { err: String(e?.message || '').slice(0, 60) });
+    } finally {
+      g?.release?.();
+    }
+    return true;
+  }
+
+  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
 }
