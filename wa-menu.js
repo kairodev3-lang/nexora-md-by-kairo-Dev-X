@@ -17,9 +17,10 @@ const DEFAULT_BRAND = {
 export const SECTIONS = [
   { icon: '🏠', title: 'GENERAL', bullet: '✧', cmds: ['menu', 'help', 'owner'] },
   { icon: '⚡', title: 'SESSION', bullet: '◈', cmds: ['alive', 'ping', 'runtime', 'status'] },
-  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['apk', 'mediafire', 'play', 'song', 'video', 'tt', 'fc', 'ig', 'twitter', 'pinterest', 'telegram'] },
+  { icon: '📥', title: 'DOWNLOAD', bullet: '⌁', cmds: ['dl', 'apk', 'mediafire', 'play', 'song', 'video', 'tt', 'fc', 'ig', 'twitter', 'pinterest', 'telegram'] },
   { icon: '🧸', title: 'MEDIA', bullet: '✧', cmds: ['sticker', 'tourl', 'vv', 'vv2', 'save', 'fancy'] },
-  { icon: '🌸', title: 'ANIME', bullet: '◈', cmds: ['waifu', 'neko'] },
+  { icon: '🌸', title: 'ANIME', bullet: '◈', cmds: ['waifu', 'neko', 'itori', 'nezuko', 'miku', 'itachi', 'naruto', 'couplepp', 'animestatus'] },
+  { icon: '🎮', title: 'GAME', bullet: '⌁', cmds: ['game', 'rps', 'dice', 'flip', 'slot', '8ball', 'guess', 'math'] },
   { icon: '🤖', title: 'AI', bullet: '⌁', cmds: ['chatgpt', 'gemini', 'aitts'] },
   { icon: '🔎', title: 'SEARCH', bullet: '✧', cmds: ['img', 'bing', 'yts'] },
   { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall'] },
@@ -28,7 +29,7 @@ export const SECTIONS = [
     icon: '⚙️',
     title: 'SETTINGS',
     bullet: '✧',
-    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'channelreact'],
+    cmds: ['mode', 'setprefix', 'autoread', 'autotyping', 'autorecording', 'anticall', 'welcome', 'goodbye', 'autoviewstatus', 'autolikestatus', 'autoreact', 'channelreact'],
   },
 ];
 export const COMMAND_COUNT = SECTIONS.reduce((n, s) => n + s.cmds.length, 0);
