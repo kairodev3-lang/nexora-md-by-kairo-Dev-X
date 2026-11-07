@@ -49,6 +49,34 @@ export class SessionManager {
     this.sessions = new Map(); // tgId -> session
     this.locks = new Map();
     this.closing = false;
+    this._startWatchdog();
+  }
+
+  /**
+   * Every minute: a session that should be connected but whose websocket is dead (without any "close" event), or that
+   * has been stuck in "connecting" for more than 2 minutes, is reopened. Keeps the bot online without a manual restart.
+   */
+  _startWatchdog() {
+    const timer = setInterval(() => {
+      if (this.closing) return;
+      const now = Date.now();
+      for (const s of this.sessions.values()) {
+        if (!s.linked || s.state === 'removed' || s.state === 'pairing') continue;
+        if (s.state === 'connected' && s.handle && !s.handle.isAlive()) {
+          this.logger.warn('watchdog: socket dead, reconnecting', { tg: s.tgId });
+          try { s.handle.close(); } catch { /* already closed */ }
+          s.handle = null;
+          this._scheduleReconnect(s, 1000);
+        } else if (s.state === 'connecting' && s.stateSince && now - s.stateSince > 120_000) {
+          this.logger.warn('watchdog: stuck connecting, retrying', { tg: s.tgId });
+          try { s.handle?.close(); } catch { /* ignore */ }
+          s.handle = null;
+          this._scheduleReconnect(s, 1000);
+        }
+      }
+    }, 60_000);
+    timer.unref?.();
+    this._watchdog = timer;
   }
 
   /* ─────────────── helpers ─────────────── */
@@ -102,6 +130,7 @@ export class SessionManager {
 
   async _openHandle(s) {
     const gen = ++s.gen;
+    s.stateSince = Date.now();
     const handle = await this.engine.open({
       tgId: s.tgId,
       authDir: this.dir(s.tgId),
@@ -173,6 +202,18 @@ export class SessionManager {
       case 'logged_out':
       case 'bad_session':
       case 'forbidden': {
+        // A single "500" is very often a temporary WhatsApp hiccup, not a broken session: deleting the session on the
+        // first one made the bot go offline for good. Only a repeated failure (3 in 5 minutes) removes the session.
+        if (e.reason === 'bad_session' && s.linked) {
+          const now = Date.now();
+          s.badStrikes = (s.badStrikes || []).filter((t) => now - t < 5 * 60_000);
+          s.badStrikes.push(now);
+          if (s.badStrikes.length < 3) {
+            this.logger.warn('bad session code, retrying', { tg: s.tgId, strikes: s.badStrikes.length });
+            this._scheduleReconnect(s);
+            return;
+          }
+        }
         const wasLinked = s.linked;
         const text =
           e.reason === 'forbidden'
@@ -291,7 +332,7 @@ export class SessionManager {
       try {
         await this._writeMeta(s);
         const handle = await this._openHandle(s);
-        const code = await withTimeout(handle.requestPairingCode(phone), 30_000, 'pairing');
+        const code = await withTimeout(handle.requestPairingCode(phone), 60_000, 'pairing');
         s.pairingTimer = setTimeout(() => {
           if (!s.linked && s.state === 'pairing') {
             this._remove(s, { notifyHtml: '⌛ The pairing code expired. Send /pair to get a new one.' }).catch(() => {});
@@ -389,6 +430,7 @@ export class SessionManager {
   /** Arrêt propre : ferme les sockets SANS déconnecter les appareils ni effacer les sessions. */
   async shutdown() {
     this.closing = true;
+    clearInterval(this._watchdog);
     for (const s of this.sessions.values()) {
       this._clearTimers(s);
       try { s.handle?.close(); } catch { /* ignore */ }
