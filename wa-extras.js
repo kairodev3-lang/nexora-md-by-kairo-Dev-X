@@ -7,7 +7,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { box } from './wa-menu.js';
-import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps } from './wa-more.js';
+import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps, youtubeId } from './wa-more.js';
+import { createNewCmds, ANIME_NAMES, GAME_NAMES, DL_NAMES, DL_ALIASES } from './wa-newcmds.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
 import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
@@ -38,8 +39,20 @@ export const DEFAULT_SETTINGS = Object.freeze({
   autoviewstatus: false,
   autolikestatus: false,
   channelreact: true,
+  autoreact: 'off', // off | all | groups | dms
+  autoreactstyle: 'mix',
 });
-const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode');
+const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode' && k !== 'autoreact' && k !== 'autoreactstyle');
+export const REACT_SCOPES = ['off', 'all', 'groups', 'dms'];
+export const REACT_STYLES = {
+  love: ['❤️', '😍', '🥰', '😘', '💖', '💕', '💞', '🫶', '💘', '😻'],
+  fun: ['😂', '🤣', '😹', '😜', '🤪', '😎', '🥳', '🤩', '😆', '🙃'],
+  fire: ['🔥', '💯', '⚡', '💥', '🚀', '👑', '💎', '🏆', '🌟', '✨'],
+  cool: ['👍', '👌', '🙌', '👏', '🤝', '💪', '✌️', '🫡', '😉', '🤙'],
+  nature: ['🌸', '🌺', '🌹', '🌻', '🍀', '🦋', '🌈', '🌙', '☀️', '🌊'],
+  dark: ['🖤', '💀', '👻', '😈', '🕷️', '🦇', '🌑', '☠️', '👽', '🤖'],
+};
+REACT_STYLES.mix = Object.values(REACT_STYLES).flat();
 
 const ALIASES = {
   autorec: 'autorecording', arecording: 'autorecording',
@@ -47,6 +60,7 @@ const ALIASES = {
   acall: 'anticall',
   autoviewsview: 'autoviewstatus', avs: 'autoviewstatus', statusseen: 'autoviewstatus', astatus: 'autoviewstatus',
   als: 'autolikestatus',
+  areact: 'autoreact', reactall: 'autoreact',
   creact: 'channelreact', chreact: 'channelreact', react: 'channelreact',
 };
 
@@ -72,21 +86,22 @@ const CMD_ALIASES = {
   instagram: 'ig', igdl: 'ig', insta: 'ig',
   tiktok: 'tt', tiktokdl: 'tt',
   mf: 'mediafire',
+  ...DL_ALIASES,
   gpt: 'chatgpt', ai: 'chatgpt', bg: 'bing', ytsearch: 'yts', ytv: 'video', yta: 'song',
   fancytext: 'fancy',
   ...MORE_ALIASES,
 };
 const COMMANDS = new Set([
   'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
-  'tt', 'fc', 'ig', 'mediafire',
-  'waifu', 'neko', 'chatgpt', 'gemini', 'aitts', 'img', 'bing', 'yts', 'play',
+  'tt', 'fc', 'ig', 'mediafire', 'autoreact',
+  'waifu', 'neko', ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES, 'chatgpt', 'gemini', 'aitts', 'img', 'bing', 'yts', 'play',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── public mode: what other people may use ───────── */
 // Everything else (settings, unblock, save, pair, telegram, getid, mode…) stays owner-only.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy', 'waifu', 'neko', 'img', 'bing', 'yts', 'play']);
-const HEAVY_CMDS = new Set(['apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'img', 'play']);
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy', 'waifu', 'neko', 'img', 'bing', 'yts', 'play', ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES]);
+const HEAVY_CMDS = new Set(['dl', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'img', 'play']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
 const GUEST_MAX_PER_WINDOW = 8;
@@ -132,6 +147,8 @@ export async function loadSettings(dir) {
     const raw = JSON.parse(await fs.readFile(path.join(dir, SETTINGS_FILE), 'utf8'));
     for (const k of BOOL_KEYS) if (typeof raw[k] === 'boolean') s[k] = raw[k];
     if (raw.mode === 'public' || raw.mode === 'private') s.mode = raw.mode;
+    if (REACT_SCOPES.includes(raw.autoreact)) s.autoreact = raw.autoreact;
+    if (typeof raw.autoreactstyle === 'string' && REACT_STYLES[raw.autoreactstyle]) s.autoreactstyle = raw.autoreactstyle;
     if (typeof raw.prefix === 'string' && raw.prefix.length === 1 && PREFIX_CHARS.includes(raw.prefix)) s.prefix = raw.prefix;
   } catch {
     /* no file or unreadable file → default values */
@@ -184,6 +201,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
   const social = createSocial({ sock, send, log });
   const contentCmds = createContent({ sock, send, log, fetchImpl, P, helpers });
+  const newCmds = createNewCmds({ sock, send, log, fetchImpl, P });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
@@ -613,11 +631,13 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     } catch (e) {
       log('warn', 'channelreact give failed', { why: String(e?.message || '').slice(0, 60) });
     }
-    const lines = [`Channel : *${r.campaign.name || '—'}*`];
+    const lines = [`Channel : *${r.campaign.name || '—'}*`, `Accounts online : *${res.pool}*`];
     if (res.followers) lines.push(`Followers : *+${res.followers}* 🎁`);
     else if (res.followersSkipped) lines.push('Free followers : already given today');
-    if (res.reacts) lines.push(`Reactions : *${res.reacts}*`);
-    lines.push('Every day : 20 new reactions, for *5 days*.', 'New posts : reacted automatically.', `Change channel : *${P()}channelreact <new link>*`);
+    else if (!res.pool) lines.push('Followers : *0* (no other connected account right now)');
+    lines.push(`Reactions : *${res.reacts}*`);
+    if (!res.reacts) lines.push('⚠️ No reaction could be sent. Check that the link is a channel you can see, then try again in a minute.');
+    lines.push('Every day : new reactions, for *5 days*.', 'New posts : reacted automatically.', `Change channel : *${P()}channelreact <new link>*`);
     return reply(box('✅ CHANNEL REACT', lines));
   }
 
@@ -653,6 +673,54 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     if (!hit) return false;
     await applyBoostLink(hit[1], reply);
     return true;
+  }
+
+  /* ───────── .autoreact [all|groups|dms|off|style <name>] ───────── */
+  const AR_ALIASES = { chats: 'dms', dm: 'dms', private: 'dms', group: 'groups', on: 'all', true: 'all', 1: 'all', false: 'off', 0: 'off' };
+  async function autoReactCmd(args, { reply }) {
+    const a = String(args[0] || '').toLowerCase();
+    if (a === 'style') {
+      const st = String(args[1] || '').toLowerCase();
+      if (!REACT_STYLES[st]) return reply(box('🎭 AUTO REACT STYLE', [`Styles : ${Object.keys(REACT_STYLES).join(' · ')}`, `Usage : *${P()}autoreact style love*`]));
+      settings.autoreactstyle = st;
+      await saveSettings(authDir, settings);
+      return reply(box('🎭 AUTO REACT STYLE', [`Style : *${st}* ✅`, REACT_STYLES[st].join(' ')]));
+    }
+    const scope = REACT_SCOPES.includes(a) ? a : AR_ALIASES[a];
+    if (!scope) {
+      return reply(box('🎭 AUTO REACT', [
+        `Status : *${settings.autoreact.toUpperCase()}* · style *${settings.autoreactstyle}*`,
+        'Reacts to incoming messages with random emojis.',
+        `*${P()}autoreact all* — groups + chats`,
+        `*${P()}autoreact groups* — groups only`,
+        `*${P()}autoreact dms* — private chats only`,
+        `*${P()}autoreact off*`,
+        `*${P()}autoreact style <${Object.keys(REACT_STYLES).join('|')}>*`,
+      ]));
+    }
+    settings.autoreact = scope;
+    await saveSettings(authDir, settings);
+    return reply(box('🎭 AUTO REACT', [`Status : *${scope.toUpperCase()}* ✅`, `Style : *${settings.autoreactstyle}*`]));
+  }
+
+  const lastReact = new Map(); // chat -> timestamp (at most one reaction every 4 s per chat: protects the account)
+  async function autoReact(m, jid) {
+    const scope = settings.autoreact;
+    if (scope === 'off') return;
+    const isGroup = jid.endsWith('@g.us');
+    if ((scope === 'groups' && !isGroup) || (scope === 'dms' && isGroup)) return;
+    const content = (helpers.normalizeMessageContent ? helpers.normalizeMessageContent(m.message) : null) || m.message || {};
+    if (content.reactionMessage || content.protocolMessage || content.senderKeyDistributionMessage) return;
+    const text = String(content.conversation || content.extendedTextMessage?.text || '');
+    if (text.startsWith(P())) return; // commands are not reacted to
+    const now = Date.now();
+    if (now - (lastReact.get(jid) || 0) < 4000) return;
+    lastReact.set(jid, now);
+    if (lastReact.size > 300) lastReact.delete(lastReact.keys().next().value);
+    const list = REACT_STYLES[settings.autoreactstyle] || REACT_STYLES.mix;
+    const emoji = list[Math.floor(Math.random() * list.length)];
+    await new Promise((r) => setTimeout(r, 700 + Math.floor(Math.random() * 1800)));
+    await sock.sendMessage(jid, { react: { text: emoji, key: m.key } });
   }
 
   /* ───────── .fancy ───────── */
@@ -742,6 +810,11 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   async function handleCommand({ cmd, args, q, jid, m, content, reply }) {
     const name = CMD_ALIASES[cmd] || ALIASES[cmd] || cmd;
     try {
+      // .video <link from any site other than YouTube> → universal downloader
+      if (name === 'video' && /https?:\/\/\S+/i.test(q) && !youtubeId(q.match(/https?:\/\/\S+/i)[0])) {
+        return await newCmds.handlers.dl({ cmd, args, q, jid, m, content, reply });
+      }
+      if (Object.hasOwn(newCmds.handlers, name)) return await newCmds.handlers[name]({ cmd, args, q, jid, m, content, reply });
       if (Object.hasOwn(more, name)) return await more[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'apk') return await apk(q, { reply, jid, m });
       if (name === 'block') return await blockCycles(args, { jid, content, reply });
@@ -757,6 +830,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       if (Object.hasOwn(contentCmds.handlers, name)) return await contentCmds.handlers[name]({ cmd, args, q, jid, m, content, reply });
       if (name === 'fancy') return await fancy(q, reply);
       if (name === 'channelreact') return await channelBoostCmd(args, { reply });
+      if (name === 'autoreact') return await autoReactCmd(args, { reply });
       if (INFO[name]) return await toggle(name, cmd, args[0], reply);
     } catch (e) {
       log('warn', 'wa command failed', { cmd: name, err: String(e?.message || 'error').slice(0, 80) });
@@ -793,6 +867,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
     if (jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) return;
     if (settings.autoread) await safe('read', () => sock.readMessages([m.key]));
+    if (settings.autoreact !== 'off') await safe('autoreact', () => autoReact(m, jid));
     if (settings.autorecording) await safe('presence', () => sock.sendPresenceUpdate('recording', jid));
     else if (settings.autotyping) await safe('presence', () => sock.sendPresenceUpdate('composing', jid));
   }
