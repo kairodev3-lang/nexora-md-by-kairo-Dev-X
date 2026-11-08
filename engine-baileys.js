@@ -167,6 +167,7 @@ export async function createBaileysEngine() {
         stateFile: path.join(authDir, '..', '_channelreact.json'),
       });
 
+      let closedWith = null; // status code when WhatsApp closes the socket before the pairing code is issued
       let readyResolve;
       const ready = new Promise((r) => { readyResolve = r; });
 
@@ -182,6 +183,7 @@ export async function createBaileysEngine() {
         if (u.connection === 'open') onEvent({ type: 'open' });
         if (u.connection === 'close') {
           const code = u.lastDisconnect?.error?.output?.statusCode;
+          closedWith = code ?? 'unknown';
           onEvent({ type: 'close', reason: CODE_BY_NUMBER[code] || 'other', code });
         }
       });
@@ -209,7 +211,8 @@ export async function createBaileysEngine() {
               if (!m.key?.fromMe && m.messageStubType) log('warn', 'wa message not decrypted', { stub: m.messageStubType, dm: !String(m.key?.remoteJid || '').endsWith('@g.us') });
               continue;
             }
-            const isOwner = Boolean(m.key?.fromMe);
+            // the owner (message written by the account itself) and the sudo users have full access
+            const isOwner = Boolean(m.key?.fromMe) || (type === 'notify' && Boolean(extras.isSudo?.(m)));
             if (!isOwner) {
               try {
                 await extras.onIncoming(m, type); // metadata only (read, presence, statuses)
@@ -306,6 +309,7 @@ export async function createBaileysEngine() {
           let lastErr;
           // WhatsApp sometimes refuses the first request while the socket is still opening: retry a few times
           for (let attempt = 0; attempt < 4; attempt++) {
+            if (closedWith != null) throw new Error(`WhatsApp closed the connection (code ${closedWith})`);
             try {
               const raw = await sock.requestPairingCode(digits);
               return String(raw).match(/.{1,4}/g)?.join('-') ?? String(raw);
