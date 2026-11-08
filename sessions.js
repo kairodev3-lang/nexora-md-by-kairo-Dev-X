@@ -184,6 +184,7 @@ export class SessionManager {
     try { s.handle?.close(); } catch { /* déjà fermé */ }
     s.handle = null;
     if (this.closing) return;
+    if (s.pairingBusy) return; // connect() is requesting the code and will retry with a new socket by itself
 
     switch (e.reason) {
       case 'restart_required': {
@@ -326,13 +327,30 @@ export class SessionManager {
         connectedAt: null,
         pairingTimer: null,
         reconnectTimer: null,
+        pairingBusy: true,
       };
       this.sessions.set(tgId, s);
 
       try {
         await this._writeMeta(s);
-        const handle = await this._openHandle(s);
-        const code = await withTimeout(handle.requestPairingCode(phone), 60_000, 'pairing');
+        // Up to 3 sockets: WhatsApp sometimes closes the first one right after it opens (bad moment / network).
+        let code = null;
+        let lastErr;
+        for (let attempt = 0; attempt < 3 && !code; attempt++) {
+          try {
+            const handle = await this._openHandle(s);
+            code = await withTimeout(handle.requestPairingCode(phone), 45_000, 'pairing');
+          } catch (err) {
+            lastErr = err;
+            this.logger.warn('pairing attempt failed', { tg: tgId, attempt, err: String(err?.message || err).slice(0, 100) });
+            try { s.handle?.close(); } catch { /* already closed */ }
+            s.handle = null;
+            if (s.state === 'removed' || this.closing) break;
+            await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          }
+        }
+        if (!code) throw lastErr || new Error('no code');
+        s.pairingBusy = false;
         s.pairingTimer = setTimeout(() => {
           if (!s.linked && s.state === 'pairing') {
             this._remove(s, { notifyHtml: '⌛ The pairing code expired. Send /pair to get a new one.' }).catch(() => {});
@@ -342,10 +360,16 @@ export class SessionManager {
         this.logger.info('pairing code issued', { tg: tgId });
         return { status: 'pairing', code, expires_in: Math.round(this.config.pairingTtlMs / 1000), phone: maskPhone(phone) };
       } catch (err) {
+        s.pairingBusy = false;
         await this._remove(s).catch(() => {});
         if (err instanceof ApiError) throw err;
-        this.logger.warn('pairing failed', { tg: tgId, err: err.message });
-        throw new ApiError('PAIRING_FAILED', 502, 'Could not get a WhatsApp pairing code right now. Check the number and try again.');
+        const why = String(err?.message || 'error').slice(0, 120);
+        this.logger.warn('pairing failed', { tg: tgId, err: why });
+        const hint = /405|403|forbidden/.test(why)
+          ? 'WhatsApp refused this server (try again later or change the host).'
+          : 'Check the number (country code, no +) and try again in a minute.';
+        this._notify(tgId, `❌ <b>Pairing failed</b>\n${hint}\n<code>${why.replace(/[<>&]/g, '')}</code>`);
+        throw new ApiError('PAIRING_FAILED', 502, `Could not get a WhatsApp pairing code: ${why}. ${hint}`, { reason: why });
       }
     });
   }
