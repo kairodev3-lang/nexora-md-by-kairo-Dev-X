@@ -8,9 +8,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps, youtubeId } from './wa-more.js';
-import { createNewCmds, ANIME_NAMES, GAME_NAMES, DL_NAMES, DL_ALIASES } from './wa-newcmds.js';
+import { createNewCmds, ANIME_NAMES, GAME_NAMES, DL_NAMES, DL_ALIASES, GROUP_NAMES, SUDO_NAMES, TOOL_NAMES, NEW_ALIASES } from './wa-newcmds.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost, lastBoostError } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
 import { createContent } from './wa-content.js';
 export { isPublicHttps };
@@ -41,8 +41,9 @@ export const DEFAULT_SETTINGS = Object.freeze({
   channelreact: true,
   autoreact: 'off', // off | all | groups | dms
   autoreactstyle: 'mix',
+  sudo: [], // numbers allowed to use owner commands
 });
-const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode' && k !== 'autoreact' && k !== 'autoreactstyle');
+const BOOL_KEYS = Object.keys(DEFAULT_SETTINGS).filter((k) => k !== 'prefix' && k !== 'mode' && k !== 'autoreact' && k !== 'autoreactstyle' && k !== 'sudo');
 export const REACT_SCOPES = ['off', 'all', 'groups', 'dms'];
 export const REACT_STYLES = {
   love: ['❤️', '😍', '🥰', '😘', '💖', '💕', '💞', '🫶', '💘', '😻'],
@@ -87,6 +88,7 @@ const CMD_ALIASES = {
   tiktok: 'tt', tiktokdl: 'tt',
   mf: 'mediafire',
   ...DL_ALIASES,
+  ...NEW_ALIASES,
   gpt: 'chatgpt', ai: 'chatgpt', bg: 'bing', ytsearch: 'yts', ytv: 'video', yta: 'song',
   fancytext: 'fancy',
   ...MORE_ALIASES,
@@ -94,13 +96,13 @@ const CMD_ALIASES = {
 const COMMANDS = new Set([
   'apk', 'block', 'unblock', 'save', 'setprefix', 'mode', 'video', 'pinterest', 'telegram', 'getid', 'idch', 'fancy',
   'tt', 'fc', 'ig', 'mediafire', 'autoreact',
-  'waifu', 'neko', ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES, 'chatgpt', 'gemini', 'aitts', 'img', 'bing', 'yts', 'play',
+  ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES, ...GROUP_NAMES, ...SUDO_NAMES, ...TOOL_NAMES, 'chatgpt', 'gemini', 'aitts', 'img', 'bing', 'yts', 'play',
   ...MORE_NAMES, ...Object.keys(INFO), ...Object.keys(ALIASES), ...Object.keys(CMD_ALIASES),
 ]);
 
 /* ───────── public mode: what other people may use ───────── */
 // Everything else (settings, unblock, save, pair, telegram, getid, mode…) stays owner-only.
-const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy', 'waifu', 'neko', 'img', 'bing', 'yts', 'play', ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES]);
+const PUBLIC_CMDS = new Set(['menu', 'help', 'owner', 'alive', 'ping', 'runtime', 'status', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'fancy', 'img', 'bing', 'yts', 'play', ...ANIME_NAMES, ...GAME_NAMES, ...DL_NAMES]);
 const HEAVY_CMDS = new Set(['dl', 'apk', 'song', 'video', 'tt', 'fc', 'ig', 'mediafire', 'twitter', 'pinterest', 'sticker', 'tourl', 'img', 'play']);
 const OWNER_ONLY_BASE = new Set(['pair', 'getpair', 'depair', 'unpair']);
 const GUEST_WINDOW_MS = 60_000;
@@ -147,6 +149,7 @@ export async function loadSettings(dir) {
     const raw = JSON.parse(await fs.readFile(path.join(dir, SETTINGS_FILE), 'utf8'));
     for (const k of BOOL_KEYS) if (typeof raw[k] === 'boolean') s[k] = raw[k];
     if (raw.mode === 'public' || raw.mode === 'private') s.mode = raw.mode;
+    if (Array.isArray(raw.sudo)) s.sudo = raw.sudo.map((x) => String(x).replace(/\D/g, '')).filter((x) => x.length >= 7 && x.length <= 15).slice(0, 30);
     if (REACT_SCOPES.includes(raw.autoreact)) s.autoreact = raw.autoreact;
     if (typeof raw.autoreactstyle === 'string' && REACT_STYLES[raw.autoreactstyle]) s.autoreactstyle = raw.autoreactstyle;
     if (typeof raw.prefix === 'string' && raw.prefix.length === 1 && PREFIX_CHARS.includes(raw.prefix)) s.prefix = raw.prefix;
@@ -201,7 +204,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   const more = createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, settings, assets });
   const social = createSocial({ sock, send, log });
   const contentCmds = createContent({ sock, send, log, fetchImpl, P, helpers });
-  const newCmds = createNewCmds({ sock, send, log, fetchImpl, P });
+  const newCmds = createNewCmds({ sock, send, log, fetchImpl, P, helpers, isSelf, settings, persist: () => saveSettings(authDir, settings) });
 
   /* ───────── .apk ───────── */
   async function apk(q, { reply, jid, m }) {
@@ -636,7 +639,10 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     else if (res.followersSkipped) lines.push('Free followers : already given today');
     else if (!res.pool) lines.push('Followers : *0* (no other connected account right now)');
     lines.push(`Reactions : *${res.reacts}*`);
-    if (!res.reacts) lines.push('⚠️ No reaction could be sent. Check that the link is a channel you can see, then try again in a minute.');
+    if (!res.reacts) {
+      lines.push('⚠️ No reaction could be sent. Check that the link is a channel you can see, then try again in a minute.');
+      if (lastBoostError()) lines.push(`Reason : ${lastBoostError()}`);
+    }
     lines.push('Every day : new reactions, for *5 days*.', 'New posts : reacted automatically.', `Change channel : *${P()}channelreact <new link>*`);
     return reply(box('✅ CHANNEL REACT', lines));
   }
@@ -851,21 +857,34 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     }
   };
 
+  // .autolikestatus: a status is only "liked" once it has been viewed; one like per status; LID / phone ids both given.
+  const liked = new Set();
+  async function likeStatus(m) {
+    const id = m.key.id;
+    if (!id || liked.has(id)) return;
+    liked.add(id);
+    if (liked.size > 500) liked.delete(liked.values().next().value);
+    const authors = [m.key.participant, m.key.participantAlt, m.participant].filter(Boolean);
+    if (!authors.length) return;
+    await new Promise((r) => setTimeout(r, 1500 + Math.floor(Math.random() * 2500)));
+    const list = [...new Set([...authors, ownJid(), sock.user?.lid].filter(Boolean))];
+    await sock.sendMessage('status@broadcast', { react: { text: '❤️', key: m.key } }, { statusJidList: list });
+  }
+
   // Messages from OTHER people: only metadata is used (never the content).
   async function onIncoming(m, type) {
-    if (type !== 'notify' || !m.key) return;
+    if (!m.key) return;
     const jid = m.key.remoteJid;
     if (!jid) return;
+    if (type !== 'notify' && !(jid === 'status@broadcast' && type === 'append')) return;
     if (jid === 'status@broadcast') {
-      if (settings.autoviewstatus) await safe('status view', () => sock.readMessages([m.key]));
-      if (settings.autolikestatus && m.key.participant) {
-        await safe('status like', () =>
-          sock.sendMessage('status@broadcast', { react: { text: '❤️', key: m.key } }, { statusJidList: [m.key.participant, ownJid()].filter(Boolean) }),
-        );
-      }
+      if (m.key.fromMe) return;
+      if (settings.autoviewstatus || settings.autolikestatus) await safe('status view', () => sock.readMessages([m.key]));
+      if (settings.autolikestatus) await likeStatus(m);
       return;
     }
     if (jid.endsWith('@newsletter') || jid.endsWith('@broadcast')) return;
+    newCmds.track(m); // ids of the last group messages (for .delete <n>)
     if (settings.autoread) await safe('read', () => sock.readMessages([m.key]));
     if (settings.autoreact !== 'off') await safe('autoreact', () => autoReact(m, jid));
     if (settings.autorecording) await safe('presence', () => sock.sendPresenceUpdate('recording', jid));
@@ -916,5 +935,5 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return true;
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate };
+  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo };
 }
