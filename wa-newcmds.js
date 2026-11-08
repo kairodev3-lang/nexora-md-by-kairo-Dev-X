@@ -1,6 +1,6 @@
 // wa-newcmds.js — new commands (loaded by wa-extras.js)
 //
-//   ANIME     .itori .nezuko .miku .itachi .naruto .couplepp .animestatus   (.waifu and .neko stay in wa-content.js)
+//   ANIME     .animu <nom|poke|cry|kiss|pat|hug|wink|face-palm|quote>   (stickers, some-random-api)
 //   GAME      .game .rps .dice .flip .slot .8ball .guess .math
 //   DOWNLOAD  .dl <link>  — video from (almost) any site: TikTok, Instagram, Facebook, X, YouTube, Pinterest, Reddit…
 //
@@ -11,24 +11,28 @@
 // Same reply style as the rest of the bot (box + typewriter font). Every media URL returned by a third-party API is
 // checked with isPublicHttps() so it can never point to an internal network.
 
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { box } from './wa-menu.js';
+import { imageToWebp, videoToWebp, addStickerMeta } from './media.js';
 import { isPublicHttps } from './wa-more.js';
 
 const UA = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
-/* ───────── ANIME ───────── */
-const GIST = (id, file) => `https://gist.githubusercontent.com/AbhishekSuresh2/${id}/raw/${file}.json`;
-const ANIME_LISTS = {
-  itori: { url: GIST('276c7a325c5c75857215a6b07b20caf2', 'itori'), emoji: '🌸', kind: 'image' },
-  nezuko: { url: GIST('9c8b667a7e116ca83895278113940b42', 'nezuko'), emoji: '🎋', kind: 'image' },
-  miku: { url: GIST('94900564d03da00d7588c78f371ce761', 'miku'), emoji: '🎤', kind: 'image' },
-  itachi: { url: GIST('d09e02e722f51f49f52b518c6acdf0c1', 'itachi'), emoji: '🌙', kind: 'image' },
-  naruto: { url: GIST('a1324f33a66624a377f8de8c91df1941', 'naruto'), emoji: '🍥', kind: 'image' },
-  couplepp: { url: GIST('78ca46a7a13e37de5a722d008ee224a0', 'couplepp'), emoji: '💞', kind: 'couple' },
-  animestatus: { url: GIST('a66de9e857973fb4fa7f191a95ee9912', 'astatus'), emoji: '🎬', kind: 'video' },
-};
-export const ANIME_NAMES = Object.keys(ANIME_LISTS);
-const LIST_TTL_MS = 30 * 60_000;
+/* ───────── ANIME (.animu) ───────── */
+export const ANIME_NAMES = ['animu'];
+const ANIMU_BASE = 'https://api.some-random-api.com/animu';
+const ANIMU_TYPES = ['nom', 'poke', 'cry', 'kiss', 'pat', 'hug', 'wink', 'face-palm', 'quote'];
+const ANIMU_ALIAS = { facepalm: 'face-palm', face_palm: 'face-palm', animuquote: 'quote', 'animu-quote': 'quote' };
+
+/* ───────── GROUP / SUDO / TOOLS ───────── */
+export const GROUP_NAMES = ['delete', 'hidetag', 'promote', 'demote'];
+export const SUDO_NAMES = ['sudo', 'delsudo'];
+export const TOOL_NAMES = ['remini'];
+export const NEW_ALIASES = { del: 'delete', ht: 'hidetag', rmsudo: 'delsudo', upscale: 'remini', hd: 'remini', url: 'tourl' };
+const RECENT_PER_CHAT = 60;
+const MAX_UPLOAD = 50 * 1024 * 1024;
 
 /* ───────── GAMES ───────── */
 export const GAME_NAMES = ['game', 'rps', 'dice', 'flip', 'slot', '8ball', 'guess', 'math'];
@@ -89,7 +93,7 @@ export function extractMedia(data) {
   return best && best.score > -5 ? { url: best.url, title: cut(title, 90) } : null;
 }
 
-export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalThis.fetch, P }) {
+export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalThis.fetch, P, helpers = {}, isSelf = () => false, settings = {}, persist = async () => {} }) {
   const react = (jid, m, emoji) => sock.sendMessage(jid, { react: { text: emoji, key: m.key } }).catch(() => {});
 
   const jget = async (url, { ms = 20_000 } = {}) => {
@@ -103,47 +107,55 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
     }
   };
 
-  /* ═════════════ ANIME ═════════════ */
-  const listCache = new Map(); // name -> { at, items }
-
-  async function loadList(name) {
-    const hit = listCache.get(name);
-    if (hit && Date.now() - hit.at < LIST_TTL_MS) return hit.items;
-    const raw = await jget(ANIME_LISTS[name].url, { ms: 25_000 });
-    const arr = Array.isArray(raw) ? raw : raw?.results || raw?.data || raw?.list || [];
-    if (!Array.isArray(arr) || !arr.length) throw new Error('empty list');
-    listCache.set(name, { at: Date.now(), items: arr });
-    return arr;
-  }
-
-  const urlOf = (x) => (typeof x === 'string' ? x : x?.url || x?.link || x?.image || x?.video || x?.src || '');
-
-  const animeCmd = (name) => async ({ jid, m, reply }) => {
-    const cfg = ANIME_LISTS[name];
-    react(jid, m, cfg.emoji);
+  /* ═════════════ ANIME (.animu) ═════════════ */
+  const animu = async ({ args, jid, m, reply }) => {
+    const raw = String(args[0] || '').toLowerCase();
+    const type = ANIMU_ALIAS[raw] || raw;
+    if (!type) return reply(box('🎌 ANIMU', [`Usage : *${P()}animu <type>*`, `Types : ${ANIMU_TYPES.join(', ')}`, `Example : *${P()}animu hug*`]));
+    if (!ANIMU_TYPES.includes(type)) return reply(box('❌ ANIMU', [`Unknown type : ${cut(type, 20)}`, `Types : ${ANIMU_TYPES.join(', ')}`]));
+    react(jid, m, '🎌');
     try {
-      const items = await loadList(name);
-      const item = pickOne(items);
-      const caption = box(`${cfg.emoji} ${name.toUpperCase()}`, ['Random pick ✨']);
-      if (cfg.kind === 'couple') {
-        const male = urlOf(item?.male);
-        const female = urlOf(item?.female);
-        if (!isPublicHttps(male, true) || !isPublicHttps(female, true)) throw new Error('bad couple item');
-        await send(jid, { image: { url: male }, caption: box('💞 COUPLE PP', ['👦 Male']) }, m, true);
-        await send(jid, { image: { url: female }, caption: box('💞 COUPLE PP', ['👧 Female']) }, m, true);
-      } else {
-        const u = urlOf(item);
-        if (!isPublicHttps(u, true)) throw new Error('bad item');
-        const isVideo = cfg.kind === 'video' || VIDEO_RE.test(u);
-        await send(jid, isVideo ? { video: { url: u }, mimetype: 'video/mp4', caption } : { image: { url: u }, caption }, m, true);
+      const data = await jget(`${ANIMU_BASE}/${type}`, { ms: 20_000 });
+      const link = data?.link;
+      if (link && isPublicHttps(link, true)) {
+        const gif = /\.gif(\?|$)/i.test(link);
+        // gif / image → sticker (same as the original command); if the conversion fails, the image is sent as it is
+        try {
+          const res = await fetchImpl(link, { signal: AbortSignal.timeout(20_000), headers: { 'user-agent': UA } });
+          if (!res.ok) throw new Error(`http ${res.status}`);
+          const buf = Buffer.from(await res.arrayBuffer());
+          const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'animu-'));
+          try {
+            const inP = path.join(tmp, gif ? 'in.gif' : 'in.img');
+            const outP = path.join(tmp, 'out.webp');
+            await fsp.writeFile(inP, buf);
+            if (gif) await videoToWebp(inP, outP, { seconds: 6 });
+            else await imageToWebp(inP, outP);
+            const webp = await addStickerMeta(await fsp.readFile(outP), { pack: 'Anime Stickers', author: process.env.BOT_NAME || 'NEXORA MD', emoji: '🎌' });
+            await send(jid, { sticker: webp }, m, true);
+          } finally {
+            fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
+          }
+          react(jid, m, '✅');
+          return null;
+        } catch (e) {
+          log('warn', 'animu sticker failed', { why: String(e?.message || '').slice(0, 60) });
+          await send(jid, { image: { url: link }, caption: `anime: ${type}` }, m, true);
+          react(jid, m, '✅');
+          return null;
+        }
       }
-      react(jid, m, '✅');
+      if (data?.quote) {
+        await send(jid, String(data.quote).slice(0, 1500), m, true);
+        react(jid, m, '✅');
+        return null;
+      }
+      throw new Error('empty answer');
     } catch (e) {
-      log('warn', `anime ${name} failed`, { why: String(e?.message || '').slice(0, 60) });
+      log('warn', 'animu failed', { why: String(e?.message || '').slice(0, 60) });
       react(jid, m, '❌');
-      return reply(box('❌ ANIME', [`Could not fetch ${name}. Try again.`]));
+      return reply(box('❌ ANIMU', ['Failed to fetch animu. Try again.']));
     }
-    return null;
   };
 
   /* ═════════════ GAMES ═════════════ */
@@ -337,10 +349,318 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
     return null;
   };
 
+  /* ═════════════ GROUP (delete / hidetag / promote / demote) ═════════════ */
+  const jn = (j) => String(j || '').split('@')[0].split(':')[0];
+  const recent = new Map(); // chat -> [{ id, participant }]   (only ids, never the content)
+
+  /** Remembers the last messages of a group so .delete <n> can remove them. */
+  function track(m) {
+    try {
+      const jid = m?.key?.remoteJid;
+      if (!jid?.endsWith('@g.us') || !m.key.id) return;
+      const arr = recent.get(jid) || [];
+      arr.push({ id: m.key.id, participant: m.key.participant || null, alt: m.key.participantAlt || null });
+      while (arr.length > RECENT_PER_CHAT) arr.shift();
+      recent.set(jid, arr);
+      if (recent.size > 200) recent.delete(recent.keys().next().value);
+    } catch { /* best effort */ }
+  }
+
+  const isAdminP = (p) => p.admin === 'admin' || p.admin === 'superadmin';
+  async function groupInfo(jid) {
+    const meta = await sock.groupMetadata(jid);
+    const isMe = (p) => [p.id, p.jid, p.phoneNumber, p.lid].some((x) => x && isSelf(x));
+    return { meta, botAdmin: meta.participants.some((p) => isAdminP(p) && isMe(p)) };
+  }
+  const groupOnly = (jid, reply) => (jid.endsWith('@g.us') ? null : reply(box('❌ GROUP', ['This command only works in a group.'])));
+  const needAdmin = (reply, what) => reply(box(`❌ ${what}`, ['The bot account must be a group admin.']));
+
+  /** Mentioned users, else the author of the replied message, else a number given as argument. */
+  function targetsOf({ args, content }, meta) {
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const out = [];
+    for (const j of ci?.mentionedJid || []) out.push(j);
+    if (!out.length && ci?.participant) out.push(ci.participant);
+    if (!out.length) {
+      for (const a of args) {
+        const d = String(a).replace(/\D/g, '');
+        if (d.length >= 7 && d.length <= 15) out.push(`${d}@s.whatsapp.net`);
+      }
+    }
+    // the group may use LID ids: use the id exactly as the group lists it
+    return [...new Set(out.map((j) => {
+      const p = meta?.participants?.find((x) => [x.id, x.jid, x.phoneNumber, x.lid].some((y) => y && jn(y) === jn(j)));
+      return p?.id || j;
+    }))];
+  }
+
+  const del = async ({ args, jid, m, content, reply }) => {
+    if (groupOnly(jid, reply)) return null;
+    const { meta, botAdmin } = await groupInfo(jid);
+    if (!botAdmin) return needAdmin(reply, 'DELETE');
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const n = Math.min(Math.max(Number.parseInt(args.find((a) => /^\d+$/.test(a)), 10) || 0, 0), 50);
+    const targets = targetsOf({ args: [], content }, meta);
+    const list = [];
+    if (ci?.stanzaId) list.push({ id: ci.stanzaId, participant: ci.participant || targets[0] });
+    const want = n || (list.length ? 0 : 0);
+    if (!list.length && !n) {
+      return reply(box('🗑️ DELETE', [`*${P()}delete 5* — last 5 messages of the group`, `*${P()}delete 3 @user* — last 3 of that user`, `*${P()}delete* (reply) — that message`]));
+    }
+    if (want) {
+      const arr = (recent.get(jid) || []).filter((x) => x.id !== m.key.id);
+      for (let i = arr.length - 1; i >= 0 && list.length < want + (ci?.stanzaId ? 1 : 0); i--) {
+        const x = arr[i];
+        if (list.some((l) => l.id === x.id)) continue;
+        if (targets.length && !targets.some((t) => [x.participant, x.alt].some((y) => y && jn(y) === jn(t)))) continue;
+        list.push({ id: x.id, participant: x.participant });
+      }
+    }
+    if (!list.length) return reply(box('🗑️ DELETE', ['No recent message found. (The bot only remembers messages received since it started.)']));
+    let done = 0;
+    for (const x of list) {
+      try {
+        await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: false, id: x.id, participant: x.participant } });
+        done++;
+        await new Promise((r) => setTimeout(r, 300));
+      } catch (e) {
+        log('warn', 'delete failed', { why: String(e?.message || '').slice(0, 50) });
+      }
+    }
+    react(jid, m, done ? '✅' : '❌');
+    return done ? null : reply(box('❌ DELETE', ['Could not delete the messages.']));
+  };
+
+  const hidetag = async ({ q, jid, m, content, reply }) => {
+    if (groupOnly(jid, reply)) return null;
+    const { meta, botAdmin } = await groupInfo(jid);
+    if (!botAdmin) return needAdmin(reply, 'HIDETAG');
+    const everyone = meta.participants.filter((p) => !isAdminP(p)).map((p) => p.id);
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const qm = ci?.quotedMessage ? (helpers.normalizeMessageContent?.(ci.quotedMessage) || ci.quotedMessage) : null;
+    let payload;
+    try {
+      if (qm?.imageMessage || qm?.videoMessage || qm?.documentMessage) {
+        const kind = qm.imageMessage ? 'image' : qm.videoMessage ? 'video' : 'document';
+        const node = qm[`${kind}Message`];
+        const msgLike = { key: { remoteJid: jid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: qm };
+        const buffer = await helpers.downloadMediaMessage(msgLike, 'buffer', {}, { logger: helpers.logger, reuploadRequest: sock.updateMediaMessage });
+        const caption = q || node.caption || '';
+        payload = kind === 'image' ? { image: buffer, caption, mentions: everyone }
+          : kind === 'video' ? { video: buffer, caption, mentions: everyone, mimetype: node.mimetype || 'video/mp4' }
+            : { document: buffer, fileName: node.fileName || 'file', mimetype: node.mimetype, caption, mentions: everyone };
+      } else if (qm && (qm.conversation || qm.extendedTextMessage?.text)) {
+        payload = { text: q || qm.conversation || qm.extendedTextMessage.text, mentions: everyone };
+      } else {
+        payload = { text: q || 'Tagged members (excluding admins).', mentions: everyone };
+      }
+    } catch (e) {
+      log('warn', 'hidetag media failed', { why: String(e?.message || '').slice(0, 50) });
+      payload = { text: q || 'Tagged members (excluding admins).', mentions: everyone };
+    }
+    await sock.sendMessage(jid, payload); // not quoted, no visible @list: that is the point of hidetag
+    return null;
+  };
+
+  const promoteDemote = (action) => async ({ args, jid, m, content, reply }) => {
+    const label = action === 'promote' ? 'PROMOTE' : 'DEMOTE';
+    if (groupOnly(jid, reply)) return null;
+    const { meta, botAdmin } = await groupInfo(jid);
+    if (!botAdmin) return needAdmin(reply, label);
+    const targets = targetsOf({ args, content }, meta);
+    if (!targets.length) return reply(box(`👑 ${label}`, [`Mention the user or reply to their message.`, `Example : *${P()}${action} @user*`]));
+    react(jid, m, '⏳');
+    try {
+      await sock.groupParticipantsUpdate(jid, targets, action);
+    } catch (e) {
+      log('warn', `${action} failed`, { why: String(e?.message || '').slice(0, 60) });
+      react(jid, m, '❌');
+      return reply(box(`❌ ${label}`, [`Failed to ${action} the user(s).`, 'Check that the bot is admin and the user is in the group.']));
+    }
+    const who = targets.map((t) => `@${jn(t)}`);
+    const by = m.key.participant || sock.user?.id || jid;
+    await send(jid, {
+      text: box(action === 'promote' ? '👑 GROUP PROMOTION' : '⬇️ GROUP DEMOTION', [
+        `${action === 'promote' ? 'Promoted' : 'Demoted'} : ${who.join(' ')}`,
+        `By : @${jn(by)}`,
+        `Date : ${new Date().toLocaleString()}`,
+      ]),
+      mentions: [...targets, by],
+    }, m, true);
+    react(jid, m, '✅');
+    return null;
+  };
+
+  /* ═════════════ SUDO ═════════════ */
+  const sudoList = () => (Array.isArray(settings.sudo) ? settings.sudo : []);
+  /** true when the sender of this message is a sudo user (treated like the owner). */
+  const isSudo = (m) => {
+    const list = sudoList();
+    if (!list.length || !m?.key) return false;
+    const c = [m.key.participant, m.key.participantAlt, m.key.remoteJid, m.key.remoteJidAlt].filter(Boolean).map(jn);
+    return c.some((x) => list.includes(x));
+  };
+  const sudoTarget = ({ args, content }) => {
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const j = ci?.mentionedJid?.[0] || ci?.participant;
+    if (j) return jn(j);
+    for (const a of args) {
+      const d = String(a).replace(/\D/g, '');
+      if (d.length >= 7 && d.length <= 15) return d;
+    }
+    return null;
+  };
+  const sudoRemove = async (num, reply) => {
+    if (!sudoList().includes(num)) return reply(box('❌ SUDO', [`@${num} is not in the sudo list.`]));
+    settings.sudo = sudoList().filter((x) => x !== num);
+    await persist();
+    return reply(box('✅ SUDO', [`Removed : *${num}*`]));
+  };
+  const sudo = async ({ args, m, content, reply }) => {
+    const sub = String(args[0] || '').toLowerCase();
+    if (sub === 'list') {
+      const l = sudoList();
+      return reply(box('👥 SUDO LIST', l.length ? l.map((x, i) => `${i + 1}. +${x}`) : ['No sudo users.']));
+    }
+    if (!['add', 'del', 'remove'].includes(sub)) {
+      return reply(box('👥 SUDO', [`*${P()}sudo add <@user|number>*`, `*${P()}sudo del <@user|number>*`, `*${P()}sudo list*`]));
+    }
+    if (!m.key.fromMe) return reply(box('❌ SUDO', ['Only the owner can add or remove sudo users.']));
+    const num = sudoTarget({ args: args.slice(1), content });
+    if (!num) return reply(box('❌ SUDO', ['Mention a user, reply to their message or give a number.']));
+    if (sub !== 'add') return sudoRemove(num, reply);
+    if (isSelf(num)) return reply(box('❌ SUDO', ['That is the owner already.']));
+    if (sudoList().includes(num)) return reply(box('✅ SUDO', [`+${num} is already sudo.`]));
+    if (sudoList().length >= 30) return reply(box('❌ SUDO', ['Sudo list is full (30).']));
+    settings.sudo = [...sudoList(), num];
+    await persist();
+    return reply(box('✅ SUDO', [`Added : *+${num}*`, 'This user can now use owner commands.']));
+  };
+  const delsudo = async ({ args, m, content, reply }) => {
+    if (!m.key.fromMe) return reply(box('❌ SUDO', ['Only the owner can remove sudo users.']));
+    const num = sudoTarget({ args, content });
+    if (!num) return reply(box('❌ SUDO', [`Usage : *${P()}delsudo <@user|number>*`]));
+    return sudoRemove(num, reply);
+  };
+
+  /* ═════════════ MEDIA → URL (.tourl / .url) and .remini ═════════════ */
+  const KIND_EXT = { imageMessage: ['image', 'jpg'], videoMessage: ['video', 'mp4'], audioMessage: ['audio', 'mp3'], stickerMessage: ['sticker', 'webp'], documentMessage: ['document', 'bin'] };
+  const norm = (x) => (helpers.normalizeMessageContent ? helpers.normalizeMessageContent(x) : null) || x;
+
+  /** Media of the message itself or of the replied message → { buffer, ext, kind, mime } | null */
+  async function getMedia({ jid, m, content }) {
+    let holder = norm(content || m?.message || {});
+    let msgLike = m;
+    let node = Object.keys(KIND_EXT).map((k) => ({ k, n: holder?.[k] })).find((x) => x.n);
+    if (!node) {
+      const ci = holder?.extendedTextMessage?.contextInfo;
+      const q = ci?.quotedMessage ? norm(ci.quotedMessage) : null;
+      node = q ? Object.keys(KIND_EXT).map((k) => ({ k, n: q[k] })).find((x) => x.n) : null;
+      if (node) msgLike = { key: { remoteJid: jid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: q };
+    }
+    if (!node || !helpers.downloadMediaMessage) return null;
+    const size = Number(node.n.fileLength?.toNumber ? node.n.fileLength.toNumber() : node.n.fileLength) || 0;
+    if (size > MAX_UPLOAD) throw new Error('File too big (max 50 MB).');
+    const buffer = await helpers.downloadMediaMessage(msgLike, 'buffer', {}, { logger: helpers.logger, reuploadRequest: sock.updateMediaMessage });
+    const [kind, def] = KIND_EXT[node.k];
+    let ext = kind === 'document' ? String(node.n.fileName || '').split('.').pop().toLowerCase() : def;
+    if (!/^[a-z0-9]{1,5}$/.test(ext)) ext = def;
+    return { buffer, ext, kind, mime: node.n.mimetype || '' };
+  }
+
+  /** Uploads to a free host (uguu → catbox → tmpfiles). Returns a public https link. */
+  async function uploadBuffer(buffer, ext) {
+    const name = `file.${ext}`;
+    const attempts = [
+      async () => {
+        const fd = new FormData();
+        fd.append('files[]', new Blob([buffer]), name);
+        const r = await fetchImpl('https://uguu.se/upload', { method: 'POST', body: fd, signal: AbortSignal.timeout(90_000), headers: { 'user-agent': UA } });
+        const j = await r.json();
+        return j?.files?.[0]?.url;
+      },
+      async () => {
+        const fd = new FormData();
+        fd.append('reqtype', 'fileupload');
+        fd.append('fileToUpload', new Blob([buffer]), name);
+        const r = await fetchImpl('https://catbox.moe/user/api.php', { method: 'POST', body: fd, signal: AbortSignal.timeout(90_000), headers: { 'user-agent': UA } });
+        return (await r.text()).trim();
+      },
+      async () => {
+        const fd = new FormData();
+        fd.append('file', new Blob([buffer]), name);
+        const r = await fetchImpl('https://tmpfiles.org/api/v1/upload', { method: 'POST', body: fd, signal: AbortSignal.timeout(90_000) });
+        const raw = (await r.json())?.data?.url;
+        const u = raw ? new URL(raw) : null;
+        return u && /(^|\.)tmpfiles\.org$/.test(u.hostname) ? `https://tmpfiles.org/dl/${u.pathname.replace(/^\/(dl\/)?/, '')}` : null;
+      },
+    ];
+    for (const run of attempts) {
+      try {
+        const url = await run();
+        if (url && isPublicHttps(url)) return url;
+      } catch (e) {
+        log('warn', 'upload host failed', { why: String(e?.message || '').slice(0, 50) });
+      }
+    }
+    throw new Error('All upload hosts failed');
+  }
+
+  const tourl = async ({ jid, m, content, reply }) => {
+    let media;
+    try {
+      media = await getMedia({ jid, m, content });
+    } catch (e) {
+      return reply(box('❌ URL', [String(e?.message || 'Failed')]));
+    }
+    if (!media) return reply(box('🔗 URL', [`Send or reply to a media (image, video, audio, sticker, document) with *${P()}url*`]));
+    react(jid, m, '⏳');
+    try {
+      const url = await uploadBuffer(media.buffer, media.ext);
+      react(jid, m, '✅');
+      return reply(box('🔗 UPLOADER', ['Upload complete ✅', `URL : ${url}`]));
+    } catch (e) {
+      react(jid, m, '❌');
+      return reply(box('❌ URL', ['Failed to upload the media.', 'Try again in a moment.']));
+    }
+  };
+
+  const remini = async ({ args, jid, m, content, reply }) => {
+    let imageUrl = String(args.join(' ')).match(URL_RE)?.[0] || '';
+    try {
+      if (!imageUrl) {
+        const media = await getMedia({ jid, m, content });
+        if (media && media.kind !== 'image' && media.kind !== 'sticker') media.bad = true;
+        if (!media || media.bad) {
+          return reply(box('📸 REMINI', ['Enhance a photo with AI.', `Reply to an image with *${P()}remini*`, `or *${P()}remini <image link>*`]));
+        }
+        react(jid, m, '⏳');
+        imageUrl = await uploadBuffer(media.buffer, media.ext);
+      } else {
+        if (!isPublicHttps(imageUrl, true)) return reply(box('❌ REMINI', ['Invalid image link.']));
+        react(jid, m, '⏳');
+      }
+      const key = process.env.REMINI_API_KEY || 'prince_tech_api_azfsbshfb';
+      const data = await jget(`https://api.princetechn.com/api/tools/remini?apikey=${encodeURIComponent(key)}&url=${encodeURIComponent(imageUrl)}`, { ms: 60_000 });
+      const out = data?.result?.image_url;
+      if (!data?.success || !out || !isPublicHttps(out, true)) throw new Error(data?.result?.message || 'API returned no image');
+      await send(jid, { image: { url: out }, caption: box('✨ REMINI', ['Image enhanced successfully!']) }, m, true);
+      react(jid, m, '✅');
+    } catch (e) {
+      log('warn', 'remini failed', { why: String(e?.message || '').slice(0, 80) });
+      react(jid, m, '❌');
+      return reply(box('❌ REMINI', ['Failed to enhance the image.', 'Try again later or with another image.']));
+    }
+    return null;
+  };
+
   const handlers = {
-    ...Object.fromEntries(ANIME_NAMES.map((n) => [n, animeCmd(n)])),
+    animu,
     game, rps, dice, flip, slot, '8ball': ball, guess, math,
     dl,
+    delete: del, hidetag, promote: promoteDemote('promote'), demote: promoteDemote('demote'),
+    sudo, delsudo,
+    tourl, remini,
   };
-  return { handlers };
+  return { handlers, track, isSudo };
 }
