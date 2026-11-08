@@ -386,8 +386,6 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
 
   return {
     handlers: {
-      waifu: anime('waifu', '🌸'),
-      neko: anime('neko', '🐱'),
       chatgpt,
       gemini,
       aitts,
