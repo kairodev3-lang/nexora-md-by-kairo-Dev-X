@@ -207,6 +207,10 @@ function pickSessions(ownerId, exclude = new Set(), n = BOOST_SIZE) {
 
 const pause = (min, spread) => new Promise((res) => setTimeout(res, min + Math.floor(Math.random() * spread)));
 
+let lastError = '';
+export const lastBoostError = () => lastError;
+const noteErr = (where, why) => { lastError = `${where}: ${String(why).slice(0, 90)}`; };
+
 const ALREADY = /already|exist|conflict|409|subscribed|follow(ing|ed)/i;
 
 async function followWith(list, jid, log) {
@@ -222,6 +226,7 @@ async function followWith(list, jid, log) {
       } catch (e) {
         const why = String(e?.message || e?.output?.payload?.message || e || '').slice(0, 80);
         if (ALREADY.test(why)) { done++; break; } // that account already follows the channel
+        noteErr('follow', why);
         log('warn', 'channel follow failed', { why, attempt });
         if (attempt === 0) await pause(1500, 1500);
       }
@@ -246,6 +251,7 @@ async function reactWith(list, jid, post, emojis, log) {
         sent++;
         break;
       } catch (e) {
+        noteErr('react', e?.message || e);
         log('warn', 'channel react failed', { why: String(e?.message || e || '').slice(0, 80), attempt });
         if (attempt === 0) await pause(1500, 1500);
       }
@@ -420,9 +426,11 @@ async function latestPostIds(socket, jid, count, log) {
       ids.sort((a, b) => Number(b) - Number(a));
       if (ids.length) return ids.slice(0, count);
     } catch (e) {
+      noteErr('posts', e?.message || e);
       log('warn', 'channel react: fetching latest posts failed', { err: String(e?.message || e).slice(0, 60) });
     }
   }
+  noteErr('posts', 'WhatsApp returned no post id for this channel');
   return [];
 }
 
