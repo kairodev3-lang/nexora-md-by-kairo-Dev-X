@@ -157,13 +157,21 @@ export async function startBoost(sock, link, ownerId) {
   const id = String(ownerId);
   const code = inviteCode(link);
   if (!code) return { ok: false, reason: 'invalid_link' };
-  let meta;
-  try {
-    meta = await sock.newsletterMetadata('invite', code);
-  } catch {
-    meta = null;
+  let meta = null;
+  for (let attempt = 0; attempt < 3 && !meta?.id; attempt++) {
+    try {
+      meta = await sock.newsletterMetadata('invite', code);
+      if (meta && !meta.id && meta.jid) meta = { ...meta, id: meta.jid };
+    } catch (e) {
+      meta = null;
+      noteErr('channel lookup', e?.message || e?.data || e);
+    }
+    if (!meta?.id && attempt < 2) await new Promise((r) => setTimeout(r, 1500));
   }
-  if (!meta?.id || !String(meta.id).endsWith('@newsletter')) return { ok: false, reason: 'not_found' };
+  if (!meta?.id || !String(meta.id).endsWith('@newsletter')) {
+    if (!lastError.startsWith('channel lookup')) noteErr('channel lookup', 'WhatsApp returned no channel for this link');
+    return { ok: false, reason: 'not_found' };
+  }
   sweep();
   if (!campaigns.has(id) && campaigns.size >= MAX_CAMPAIGNS) return { ok: false, reason: 'full' };
   const campaign = {
@@ -207,6 +215,19 @@ function pickSessions(ownerId, exclude = new Set(), n = BOOST_SIZE) {
 
 const pause = (min, spread) => new Promise((res) => setTimeout(res, min + Math.floor(Math.random() * spread)));
 
+/** Runs fn on the items with at most `limit` at the same time (the accounts are different, so it is safe and much faster). */
+async function eachLimit(items, limit, fn) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
+const PARALLEL = 6;
+
 let lastError = '';
 export const lastBoostError = () => lastError;
 const noteErr = (where, why) => { lastError = `${where}: ${String(why).slice(0, 90)}`; };
@@ -215,8 +236,8 @@ const ALREADY = /already|exist|conflict|409|subscribed|follow(ing|ed)/i;
 
 async function followWith(list, jid, log) {
   let done = 0;
-  for (const [, x] of list) {
-    await pause(800, 1500);
+  await eachLimit(list, PARALLEL, async ([, x]) => {
+    await pause(100, 500);
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         await x.socket.newsletterFollow(jid);
@@ -228,11 +249,11 @@ async function followWith(list, jid, log) {
         if (ALREADY.test(why)) { done++; break; } // that account already follows the channel
         noteErr('follow', why);
         log('warn', 'channel follow failed', { why, attempt });
-        if (attempt === 0) await pause(1500, 1500);
+        if (attempt === 0) await pause(800, 700);
       }
     }
     try { await x.socket.subscribeNewsletterUpdates?.(jid); } catch { /* live updates are optional */ }
-  }
+  });
   return done;
 }
 
@@ -248,8 +269,8 @@ async function reactWith(list, jid, post, emojis, log) {
   reactedOn.set(key, seen);
   if (reactedOn.size > 300) reactedOn.delete(reactedOn.keys().next().value);
   let sent = 0;
-  for (const [i, [sid, x]] of list.entries()) {
-    await pause(700, 1300);
+  await eachLimit(list, PARALLEL, async ([sid, x], i) => {
+    await pause(100, 500);
     await prepareReact(x, jid);
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
@@ -260,10 +281,10 @@ async function reactWith(list, jid, post, emojis, log) {
       } catch (e) {
         noteErr('react', e?.message || e);
         log('warn', 'channel react failed', { why: String(e?.message || e || '').slice(0, 80), attempt });
-        if (attempt < 2) await pause(2500, 2000);
+        if (attempt < 2) await pause(1200, 1000);
       }
     }
-  }
+  });
   return sent;
 }
 
@@ -288,7 +309,7 @@ export async function giveBoost(sock, campaign, log = () => {}) {
     followers = await followWith(pool, c.jid, log);
     if (!followers) followCooldown.delete(c.ownerId); // nothing happened: allow a retry
   }
-  await pause(4000, 1500); // let the follows settle before asking for the posts
+  await pause(2000, 800); // let the follows settle before asking for the posts
   try { await sock.newsletterFollow?.(c.jid); } catch { /* already following */ }
   let ids = await latestPostIds(sock, c.jid, 1, log);
   for (let k = 0; !ids.length && k < Math.min(3, pool.length); k++) ids = await latestPostIds(pool[k][1].socket, c.jid, 1, log);
@@ -407,9 +428,8 @@ async function brandTick(log) {
       brandSeen.set(key, seen);
       const emojis = shuffle(EMOJIS);
       let i = 0;
-      for (const [sid, x] of online) {
-        if (seen.has(sid)) continue;
-        if (sent >= BRAND_MAX_PER_TICK) break;
+      const todo = online.filter(([sid]) => !seen.has(sid)).slice(0, Math.max(0, BRAND_MAX_PER_TICK - sent));
+      await eachLimit(todo, PARALLEL, async ([sid, x]) => {
         if (!x.followedBrand) {
           try { await x.socket.newsletterFollow(channel.jid); } catch { /* already following */ }
           x.followedBrand = true;
@@ -422,8 +442,8 @@ async function brandTick(log) {
           noteErr('brand react', e?.message || e);
           log('warn', 'brand reaction failed', { err: String(e?.message || e).slice(0, 80) });
         }
-        await pause(250, 500);
-      }
+        await pause(100, 300);
+      });
     }
     if (sent) {
       log('info', 'brand reactions sent', { sent, sessions: online.length });
