@@ -67,7 +67,12 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
       .trim()
       .replace(/^["'`]+|["'`]+$/g, '')
       .trim();
-  const MODEL_RETRY = /not found|404|overload|unavailable|503|429|quota|exhausted|rate|deprecated|no longer/i;
+  /** Keys starting with "AQ." come from Vertex AI (express mode); "AIza…" keys come from Google AI Studio. */
+  const genUrl = (key, model) =>
+    /^AQ\./.test(key)
+      ? `https://aiplatform.googleapis.com/v1/publishers/google/models/${encodeURIComponent(model)}:generateContent`
+      : `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const MODEL_RETRY = /not found|404|overload|unavailable|503|429|quota|exhausted|rate|deprecated|no longer|abort|timeout|timed out|fetch failed|thinking|invalid argument|unsupported/i;
 
   const quotedText = (content) => {
     const q = content?.extendedTextMessage?.contextInfo?.quotedMessage;
@@ -133,18 +138,22 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
   const GEM_SYSTEM = 'You are NEXORA MD, a friendly WhatsApp assistant. Answer in the same language as the user (Haitian Creole, French, English, Spanish...). Be clear and concise. When an image is given, describe or analyse it and answer the question about it.';
 
   /** Calls generateContent, trying the next model when one is unknown / overloaded / out of quota. */
-  async function geminiCall(key, body, models) {
+  async function geminiCall(key, body, models, { ms = 30_000, fast = false } = {}) {
     let last;
     for (const model of models) {
       try {
-        return await jpost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, body, { headers: { 'x-goog-api-key': key }, ms: 90_000 });
+        // 2.5-flash "thinks" before answering, which can take very long: a chat answer does not need it
+        const b = fast && /^gemini-2\.5-flash/.test(model) && !/tts|image/.test(model)
+          ? { ...body, generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingBudget: 0 } } }
+          : body;
+        return await jpost(genUrl(key, model), b, { headers: { 'x-goog-api-key': key }, ms });
       } catch (e) {
         last = e;
         if (!MODEL_RETRY.test(String(e?.message || ''))) throw e; // wrong key, blocked prompt…: another model will not help
       }
     }
     // every model name is unknown / retired: ask Google which models this key can use and try those
-    if (last && /not found|404|deprecated|no longer/i.test(String(last.message || ''))) {
+    if (last && !/^AQ\./.test(key) && /not found|404|deprecated|no longer/i.test(String(last.message || ''))) {
       try {
         const wantTts = models.some((x) => /tts/i.test(x));
         const list = await jget('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key }, ms: 20_000 });
@@ -185,8 +194,8 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
     try {
       const parts = [{ text: (prompt || 'Describe this image in detail.').slice(0, 8000) }];
       if (image) parts.push({ inline_data: { mime_type: image.mime, data: image.buffer.toString('base64') } });
-      const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'].filter(Boolean))];
-      const d = await geminiCall(key, { systemInstruction: { parts: [{ text: GEM_SYSTEM }] }, contents: [{ role: 'user', parts }] }, models);
+      const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite', 'gemini-flash-latest'].filter(Boolean))];
+      const d = await geminiCall(key, { systemInstruction: { parts: [{ text: GEM_SYSTEM }] }, contents: [{ role: 'user', parts }], generationConfig: { maxOutputTokens: 1500 } }, models, { ms: 30_000, fast: true });
       const text = (d?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
       if (!text) throw new Error(d?.promptFeedback?.blockReason ? `Blocked: ${d.promptFeedback.blockReason}` : 'empty answer');
       await send(jid, `✨ *GEMINI*\n\n${text.slice(0, AI_MAX)}`, m, true);
@@ -254,7 +263,7 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
         contents: [{ parts: [{ text: text.slice(0, 1500) }] }],
         generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } },
       };
-      const d = await geminiCall(key, body, models);
+      const d = await geminiCall(key, body, models, { ms: 60_000 });
       const inline = (d?.candidates?.[0]?.content?.parts || []).map((p) => p.inlineData || p.inline_data).find((x) => x?.data);
       if (!inline) throw new Error('Gemini returned no audio');
       const pcm = Buffer.from(inline.data, 'base64');
