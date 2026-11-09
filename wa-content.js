@@ -3,10 +3,16 @@
 //
 // Environment variables (AI commands are owner-only because they use your API quota):
 //   OPENAI_API_KEY (+ OPENAI_MODEL)   → .chatgpt
-//   GEMINI_API_KEY (+ GEMINI_MODEL)   → .gemini
-//   ELEVENLABS_API_KEY                → .aitts
+//   GEMINI_API_KEY (+ GEMINI_MODEL)   → .gemini (text + photos) and .aitts (voice, when there is no ELEVENLABS_API_KEY)
+//   GEMINI_TTS_MODEL                  → optional, model used by .aitts
+//   ELEVENLABS_API_KEY                → .aitts with ElevenLabs voices (optional)
+// Set the keys as Railway variables (Variables tab). Quotes and spaces around the value are ignored.
 
+import fsp from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { box } from './wa-menu.js';
+import { runFfmpeg } from './media.js';
 import { isPublicHttps, youtubeId } from './wa-more.js';
 
 const UA = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
@@ -55,6 +61,14 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
   };
 
   /** Text of the replied-to message, if any. */
+  /** Gemini key from the Railway variables (quotes / spaces / line breaks pasted by mistake are removed). */
+  const gemKey = () =>
+    String(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.GOOGLE_GENAI_API_KEY || '')
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .trim();
+  const MODEL_RETRY = /not found|404|overload|unavailable|503|429|quota|exhausted|rate|deprecated|no longer/i;
+
   const quotedText = (content) => {
     const q = content?.extendedTextMessage?.contextInfo?.quotedMessage;
     return q ? String(q.conversation || q.extendedTextMessage?.text || q.imageMessage?.caption || '').trim() : '';
@@ -116,6 +130,44 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
     return null;
   }
 
+  const GEM_SYSTEM = 'You are NEXORA MD, a friendly WhatsApp assistant. Answer in the same language as the user (Haitian Creole, French, English, Spanish...). Be clear and concise. When an image is given, describe or analyse it and answer the question about it.';
+
+  /** Calls generateContent, trying the next model when one is unknown / overloaded / out of quota. */
+  async function geminiCall(key, body, models) {
+    let last;
+    for (const model of models) {
+      try {
+        return await jpost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, body, { headers: { 'x-goog-api-key': key }, ms: 90_000 });
+      } catch (e) {
+        last = e;
+        if (!MODEL_RETRY.test(String(e?.message || ''))) throw e; // wrong key, blocked prompt…: another model will not help
+      }
+    }
+    // every model name is unknown / retired: ask Google which models this key can use and try those
+    if (last && /not found|404|deprecated|no longer/i.test(String(last.message || ''))) {
+      try {
+        const wantTts = models.some((x) => /tts/i.test(x));
+        const list = await jget('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', { headers: { 'x-goog-api-key': key }, ms: 20_000 });
+        const found = (list?.models || [])
+          .filter((x) => (x.supportedGenerationMethods || []).includes('generateContent'))
+          .map((x) => String(x.name || '').replace(/^models\//, ''))
+          .filter((n) => (wantTts ? /tts/i.test(n) : /flash/i.test(n) && !/tts|image|live|embed|thinking|lite|robotics|computer/i.test(n)))
+          .filter((n) => !models.includes(n))
+          .slice(0, 3);
+        for (const model of found) {
+          try {
+            return await jpost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, body, { headers: { 'x-goog-api-key': key }, ms: 90_000 });
+          } catch (e) {
+            last = e;
+          }
+        }
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw last || new Error('Gemini unavailable');
+  }
+
   async function gemini({ q, jid, m, content, reply }) {
     const prompt = [String(q || '').trim(), quotedText(content)].filter(Boolean).join('\n\n');
     let image = null;
@@ -125,23 +177,24 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
       /* no image */
     }
     if (!prompt && !image) {
-      return reply(box('✨ GEMINI', [`Usage : *${P()}gemini <question>*`, `Example : *${P()}gemini who is iron man?*`, 'With an image: reply to it and add a question.']));
+      return reply(box('✨ GEMINI', [`Usage : *${P()}gemini <question>*`, `Example : *${P()}gemini who is iron man?*`, 'Photo: send it with the caption *' + P() + 'gemini <question>* or reply to it.']));
     }
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) return reply(box('❌ GEMINI', ['GEMINI_API_KEY is missing on the server.']));
+    const key = gemKey();
+    if (!key) return reply(box('❌ GEMINI', ['GEMINI_API_KEY is missing.', 'Railway → your service → Variables → add GEMINI_API_KEY, then redeploy.']));
     react(jid, m, '✨');
     try {
-      const parts = [{ text: (prompt || 'Describe this image.').slice(0, 8000) }];
+      const parts = [{ text: (prompt || 'Describe this image in detail.').slice(0, 8000) }];
       if (image) parts.push({ inline_data: { mime_type: image.mime, data: image.buffer.toString('base64') } });
-      const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-      const d = await jpost(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, { contents: [{ parts }] }, { headers: { 'x-goog-api-key': key } });
+      const models = [...new Set([process.env.GEMINI_MODEL, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-flash-latest'].filter(Boolean))];
+      const d = await geminiCall(key, { systemInstruction: { parts: [{ text: GEM_SYSTEM }] }, contents: [{ role: 'user', parts }] }, models);
       const text = (d?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
-      if (!text) throw new Error('empty answer');
+      if (!text) throw new Error(d?.promptFeedback?.blockReason ? `Blocked: ${d.promptFeedback.blockReason}` : 'empty answer');
       await send(jid, `✨ *GEMINI*\n\n${text.slice(0, AI_MAX)}`, m, true);
       react(jid, m, '✅');
     } catch (e) {
+      log('warn', 'gemini failed', { why: String(e?.message || '').slice(0, 100) });
       react(jid, m, '❌');
-      return reply(box('❌ GEMINI', [cut(e?.message || 'Failed', 120)]));
+      return reply(box('❌ GEMINI', [cut(e?.message || 'Failed', 140)]));
     }
     return null;
   }
@@ -155,13 +208,78 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
     return voices.list;
   }
 
-  async function aitts({ q, jid, m, reply }) {
-    const key = process.env.ELEVENLABS_API_KEY;
-    const text0 = String(q || '').trim();
-    if (!text0) {
-      return reply(box('🎙️ AI VOICE', [`Usage : *${P()}aitts <text>, <voice>*`, `Example : *${P()}aitts hello my friend, adam*`, `Voices : *${P()}aitts list*`]));
+  const GEM_VOICES = ['Kore', 'Puck', 'Charon', 'Zephyr', 'Aoede', 'Fenrir', 'Leda', 'Orus', 'Callirrhoe', 'Autonoe', 'Enceladus', 'Iapetus', 'Umbriel', 'Algieba', 'Despina', 'Erinome', 'Algenib', 'Rasalgethi', 'Laomedeia', 'Achernar', 'Alnilam', 'Schedar', 'Gacrux', 'Pulcherrima', 'Achird', 'Zubenelgenubi', 'Vindemiatrix', 'Sadachbia', 'Sadaltager', 'Sulafat'];
+
+  /** PCM 16-bit 24 kHz mono (what Gemini TTS returns) → mp3 with ffmpeg, or a plain WAV when ffmpeg is not usable. */
+  async function pcmToAudio(pcm) {
+    const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'tts-'));
+    try {
+      const inP = path.join(tmp, 'in.pcm');
+      const outP = path.join(tmp, 'out.mp3');
+      await fsp.writeFile(inP, pcm);
+      await runFfmpeg(['-y', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', inP, '-c:a', 'libmp3lame', '-b:a', '96k', outP], 60_000);
+      return { buffer: await fsp.readFile(outP), mimetype: 'audio/mpeg' };
+    } catch {
+      const h = Buffer.alloc(44);
+      h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8); h.write('fmt ', 12);
+      h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(24000, 24);
+      h.writeUInt32LE(48000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write('data', 36); h.writeUInt32LE(pcm.length, 40);
+      return { buffer: Buffer.concat([h, pcm]), mimetype: 'audio/wav' };
+    } finally {
+      fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
     }
-    if (!key) return reply(box('❌ AI VOICE', ['ELEVENLABS_API_KEY is missing on the server.']));
+  }
+
+  async function aittsGemini({ text0, jid, m, reply }) {
+    const key = gemKey();
+    if (!key) return reply(box('❌ AI VOICE', ['GEMINI_API_KEY is missing.', 'Railway → Variables → add GEMINI_API_KEY, then redeploy.']));
+    if (/^list$/i.test(text0)) return reply(box('🎙️ AI VOICES', GEM_VOICES.map((v, i) => `${i + 1}. ${v}`)));
+    react(jid, m, '🎙️');
+    try {
+      // "text, voice" → the last comma part is the voice when it is a known voice name
+      const c = text0.lastIndexOf(',');
+      let text = text0;
+      let voice = 'Kore';
+      if (c > 0) {
+        const wanted = text0.slice(c + 1).trim().toLowerCase();
+        const hit = GEM_VOICES.find((v) => v.toLowerCase() === wanted);
+        if (hit) {
+          voice = hit;
+          text = text0.slice(0, c).trim();
+        }
+      }
+      if (!text) throw new Error('empty text');
+      const models = [...new Set([process.env.GEMINI_TTS_MODEL, 'gemini-2.5-flash-preview-tts', 'gemini-2.5-flash-tts', 'gemini-2.5-pro-preview-tts'].filter(Boolean))];
+      const body = {
+        contents: [{ parts: [{ text: text.slice(0, 1500) }] }],
+        generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } } },
+      };
+      const d = await geminiCall(key, body, models);
+      const inline = (d?.candidates?.[0]?.content?.parts || []).map((p) => p.inlineData || p.inline_data).find((x) => x?.data);
+      if (!inline) throw new Error('Gemini returned no audio');
+      const pcm = Buffer.from(inline.data, 'base64');
+      if (pcm.length < 1000) throw new Error('empty audio');
+      const out = await pcmToAudio(pcm);
+      await send(jid, { audio: out.buffer, mimetype: out.mimetype, ptt: false }, m, true);
+      react(jid, m, '✅');
+    } catch (e) {
+      log('warn', 'aitts gemini failed', { why: String(e?.message || '').slice(0, 100) });
+      react(jid, m, '❌');
+      return reply(box('❌ AI VOICE', [cut(e?.message || 'Failed', 140)]));
+    }
+    return null;
+  }
+
+  async function aitts({ q, jid, m, content, reply }) {
+    const key = process.env.ELEVENLABS_API_KEY;
+    // no text given but a message is replied to (for example the answer of .gemini) → that text is read aloud
+    const quoted = quotedText(content).replace(/^✨\s*\*?GEMINI\*?\s*/i, '').trim();
+    const text0 = String(q || '').trim() || quoted;
+    if (!key && gemKey() && text0) return aittsGemini({ text0, jid, m, reply });
+    if (!text0) {
+      return reply(box('🎙️ AI VOICE', [`Usage : *${P()}aitts <text>, <voice>*`, `Example : *${P()}aitts hello my friend, ${key ? 'adam' : 'Kore'}*`, `Voices : *${P()}aitts list*`]));
+    }
+    if (!key) return reply(box('❌ AI VOICE', ['No key found.', 'Add GEMINI_API_KEY (or ELEVENLABS_API_KEY) in the Railway variables.']));
     react(jid, m, '🎙️');
     try {
       const list = await getVoices(key);
@@ -201,7 +319,47 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
 
   /* ───────── search ───────── */
   // .img <query>[, count] — Bing images (safe search on)
+  // .img couplepp → two matching profile pictures (one for him, one for her)
+  const COUPLE_URL = process.env.COUPLEPP_URL || 'https://gist.githubusercontent.com/AbhishekSuresh2/78ca46a7a13e37de5a722d008ee224a0/raw/couplepp.json';
+  let coupleCache = { at: 0, list: [] };
+  async function couplepp({ jid, m, reply }) {
+    react(jid, m, '💞');
+    try {
+      if (Date.now() - coupleCache.at > 30 * 60_000 || !coupleCache.list.length) {
+        const raw = await jget(COUPLE_URL, { ms: 25_000 });
+        const arr = (Array.isArray(raw) ? raw : raw?.results || raw?.data || []).filter((x) => x?.male && x?.female);
+        if (!arr.length) throw new Error('empty list');
+        coupleCache = { at: Date.now(), list: arr };
+      }
+      const pairs = coupleCache.list;
+      for (let tries = 0; tries < 4; tries++) {
+        const p = pairs[Math.floor(Math.random() * pairs.length)];
+        const male = typeof p.male === 'string' ? p.male : p.male?.url;
+        const female = typeof p.female === 'string' ? p.female : p.female?.url;
+        if (!isPublicHttps(male, true) || !isPublicHttps(female, true)) continue;
+        try {
+          await send(jid, { image: { url: male }, caption: '💞 *Couple PP* — 👦 for him' }, m, true);
+          await new Promise((r) => setTimeout(r, 700));
+          await send(jid, { image: { url: female }, caption: '💞 *Couple PP* — 👧 for her' }, m, true);
+          react(jid, m, '✅');
+          return null;
+        } catch { /* dead link: another pair */ }
+      }
+      throw new Error('no working pair');
+    } catch (e) {
+      log('warn', 'couplepp failed', { why: String(e?.message || '').slice(0, 60) });
+      // the list is unreachable: fall back to an image search for matching couple pictures (2 images)
+      try {
+        return await img({ q: 'matching couple pfp aesthetic, 2', jid, m, reply });
+      } catch {
+        react(jid, m, '❌');
+        return reply(box('❌ COUPLE PP', ['Could not fetch a couple picture. Try again.']));
+      }
+    }
+  }
+
   async function img({ q, jid, m, reply }) {
+    if (/^\s*(couple\s*-?\s*pp|couplepp|cpp|couple)\s*$/i.test(String(q || ''))) return couplepp({ jid, m, reply });
     const [queryRaw, countRaw] = String(q || '').split(',').map((x) => x.trim());
     const query = cut(queryRaw, 100);
     if (!query) return reply(box('🖼️ IMAGES', [`Usage : *${P()}img <query>, <count>*`, `Example : *${P()}img ironman, 5*`]));
