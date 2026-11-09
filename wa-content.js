@@ -67,11 +67,18 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
       .trim()
       .replace(/^["'`]+|["'`]+$/g, '')
       .trim();
-  /** Keys starting with "AQ." come from Vertex AI (express mode); "AIza…" keys come from Google AI Studio. */
-  const genUrl = (key, model) =>
-    /^AQ\./.test(key)
-      ? `https://aiplatform.googleapis.com/v1/publishers/google/models/${encodeURIComponent(model)}:generateContent`
-      : `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  /**
+   * "AIza…" keys come from Google AI Studio (Generative Language API). "AQ.…" keys can belong to Vertex AI (express mode).
+   * For an AQ key both endpoints are tried, and the one that works is remembered.
+   */
+  const endpointPref = new Map(); // key -> 'gl' | 'vx'
+  const genUrls = (key, model) => {
+    const gl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+    const vx = `https://aiplatform.googleapis.com/v1/publishers/google/models/${encodeURIComponent(model)}:generateContent`;
+    if (!/^AQ\./.test(key)) return [gl];
+    return endpointPref.get(key) === 'vx' ? [vx, gl] : [gl, vx];
+  };
+  const ENDPOINT_RETRY = /has not been used|is disabled|not valid|unregistered|permission|forbidden|not found|404|403|401/i;
   const MODEL_RETRY = /not found|404|overload|unavailable|503|429|quota|exhausted|rate|deprecated|no longer|abort|timeout|timed out|fetch failed|thinking|invalid argument|unsupported/i;
 
   const quotedText = (content) => {
@@ -146,7 +153,18 @@ export function createContent({ sock, send, log = () => {}, fetchImpl = globalTh
         const b = fast && /^gemini-2\.5-flash/.test(model) && !/tts|image/.test(model)
           ? { ...body, generationConfig: { ...(body.generationConfig || {}), thinkingConfig: { thinkingBudget: 0 } } }
           : body;
-        return await jpost(genUrl(key, model), b, { headers: { 'x-goog-api-key': key }, ms });
+        let lastE;
+        for (const u of genUrls(key, model)) {
+          try {
+            const out = await jpost(u, b, { headers: { 'x-goog-api-key': key }, ms });
+            if (/^AQ\./.test(key)) endpointPref.set(key, u.includes('aiplatform') ? 'vx' : 'gl');
+            return out;
+          } catch (e) {
+            lastE = e;
+            if (!ENDPOINT_RETRY.test(String(e?.message || ''))) throw e;
+          }
+        }
+        throw lastE;
       } catch (e) {
         last = e;
         if (!MODEL_RETRY.test(String(e?.message || ''))) throw e; // wrong key, blocked prompt…: another model will not help
