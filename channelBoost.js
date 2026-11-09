@@ -39,7 +39,7 @@ export const channel = {
   jid: process.env.CHANNEL_JID || '120363409975095814@newsletter',
   name: process.env.CHANNEL_NAME || 'NEXORA MD',
   url: process.env.CHANNEL_URL || 'https://whatsapp.com/channel/0029VbDmi1g77qVOA4cfRq13',
-  resolved: Boolean(process.env.CHANNEL_JID),
+  resolved: true, // the JID above is used as it is (an old invite link can never redirect the reactions to another channel)
 };
 export const inviteCode = (url = channel.url) => String(url).match(/whatsapp\.com\/channel\/([\w-]+)/i)?.[1] || null;
 
@@ -236,6 +236,12 @@ async function followWith(list, jid, log) {
   return done;
 }
 
+/** An account that just followed a channel needs a moment, and a metadata call, before WhatsApp lets it react. */
+async function prepareReact(x, jid) {
+  try { await x.socket.newsletterMetadata?.('jid', jid); } catch { /* optional */ }
+  try { await x.socket.subscribeNewsletterUpdates?.(jid); } catch { /* optional */ }
+}
+
 async function reactWith(list, jid, post, emojis, log) {
   const key = `${jid}:${post}`;
   const seen = reactedOn.get(key) || new Set();
@@ -244,16 +250,17 @@ async function reactWith(list, jid, post, emojis, log) {
   let sent = 0;
   for (const [i, [sid, x]] of list.entries()) {
     await pause(700, 1300);
-    for (let attempt = 0; attempt < 2; attempt++) {
+    await prepareReact(x, jid);
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await x.socket.newsletterReactMessage(jid, String(post), emojis[i % emojis.length]);
+        await reactSafe(x.socket, jid, post, emojis[i % emojis.length]);
         seen.add(sid);
         sent++;
         break;
       } catch (e) {
         noteErr('react', e?.message || e);
         log('warn', 'channel react failed', { why: String(e?.message || e || '').slice(0, 80), attempt });
-        if (attempt === 0) await pause(1500, 1500);
+        if (attempt < 2) await pause(2500, 2000);
       }
     }
   }
@@ -281,8 +288,10 @@ export async function giveBoost(sock, campaign, log = () => {}) {
     followers = await followWith(pool, c.jid, log);
     if (!followers) followCooldown.delete(c.ownerId); // nothing happened: allow a retry
   }
+  await pause(4000, 1500); // let the follows settle before asking for the posts
+  try { await sock.newsletterFollow?.(c.jid); } catch { /* already following */ }
   let ids = await latestPostIds(sock, c.jid, 1, log);
-  if (!ids.length) ids = await latestPostIds(pool[0][1].socket, c.jid, 1, log);
+  for (let k = 0; !ids.length && k < Math.min(3, pool.length); k++) ids = await latestPostIds(pool[k][1].socket, c.jid, 1, log);
   const reacts = ids.length ? await reactWith(pool, c.jid, ids[0], c.emojis, log) : 0;
   c.nextRound = Date.now() + ROUND_MS;
   await saveState();
@@ -322,6 +331,8 @@ function startTicker(log) {
     }
   }, 30 * 60 * 1000);
   ticker.unref?.();
+  const bt = setInterval(() => brandTick(log), 3 * 60 * 1000);
+  bt.unref?.();
 }
 
 export function stopBoost(ownerId) {
@@ -340,30 +351,111 @@ const fresh = (message) => {
   return !ts || Date.now() / 1000 - ts <= MAX_POST_AGE_SEC;
 };
 
-/** Brand channel: sessions share the work, random target (34 / 40 / 70), a different emoji per reaction. */
+// Brand channel: EVERY connected session (with .channelreact ON) reacts once to each of the 5 latest posts.
+// 100 sessions connected = 100 reactions under every post, automatically. A new session also catches up on the 5 latest posts.
+const BRAND_POSTS = 5;
+const BRAND_MAX_PER_TICK = 400;
+const brandSeen = new Map(); // "jid:serverId" -> Set(sessionId) that reacted
+let brandFile = null;
+let brandBusy = false;
+
+async function loadBrand(file) {
+  brandFile = file.replace(/[^/\\]*$/, '_brandreact.json');
+  try {
+    const { readFile } = await import('node:fs/promises');
+    const raw = JSON.parse(await readFile(brandFile, 'utf8'));
+    for (const [k, v] of Object.entries(raw || {})) if (Array.isArray(v)) brandSeen.set(k, new Set(v.map(String)));
+  } catch {
+    /* nothing saved yet */
+  }
+}
+
+async function saveBrand() {
+  if (!brandFile) return;
+  try {
+    const { writeFile, rename } = await import('node:fs/promises');
+    const keys = [...brandSeen.keys()].slice(-12);
+    const out = Object.fromEntries(keys.map((k) => [k, [...brandSeen.get(k)]]));
+    const tmp = `${brandFile}.${process.pid}.tmp`;
+    await writeFile(tmp, JSON.stringify(out), { mode: 0o600 });
+    await rename(tmp, brandFile);
+  } catch {
+    /* kept in memory */
+  }
+}
+
+async function brandTick(log) {
+  if (brandBusy) return;
+  brandBusy = true;
+  try {
+    const online = shuffle([...liveSessions.entries()].filter(([, x]) => isOnline(x) && (typeof x.isEnabled !== 'function' || x.isEnabled())));
+    if (!online.length) return;
+    let ids = [];
+    for (const [, x] of online.slice(0, 6)) {
+      try { await x.socket.newsletterFollow?.(channel.jid); } catch { /* already following */ }
+      ids = await latestPostIds(x.socket, channel.jid, BRAND_POSTS, log);
+      if (ids.length) break;
+    }
+    if (!ids.length) {
+      log('warn', 'brand channel: no post found', { why: lastError });
+      return;
+    }
+    let sent = 0;
+    for (const post of ids) {
+      const key = `${channel.jid}:${post}`;
+      const seen = brandSeen.get(key) || new Set();
+      brandSeen.set(key, seen);
+      const emojis = shuffle(EMOJIS);
+      let i = 0;
+      for (const [sid, x] of online) {
+        if (seen.has(sid)) continue;
+        if (sent >= BRAND_MAX_PER_TICK) break;
+        if (!x.followedBrand) {
+          try { await x.socket.newsletterFollow(channel.jid); } catch { /* already following */ }
+          x.followedBrand = true;
+        }
+        try {
+          await reactSafe(x.socket, channel.jid, post, emojis[i++ % emojis.length]);
+          seen.add(sid);
+          sent++;
+        } catch (e) {
+          noteErr('brand react', e?.message || e);
+          log('warn', 'brand reaction failed', { err: String(e?.message || e).slice(0, 80) });
+        }
+        await pause(250, 500);
+      }
+    }
+    if (sent) {
+      log('info', 'brand reactions sent', { sent, sessions: online.length });
+      await saveBrand();
+    }
+  } catch (e) {
+    log('warn', 'brand tick failed', { err: String(e?.message || e).slice(0, 80) });
+  } finally {
+    brandBusy = false;
+  }
+}
+
+/** Live post on the brand channel: this session reacts after a random delay (the tick above catches whatever is missed). */
 function handleBrandPost(socket, message, log) {
   const serverId = postId(message);
   if (!serverId || !fresh(message)) return;
   const key = `${channel.jid}:${serverId}`;
-  let st = brandPosts.get(key);
-  if (!st) {
-    st = { target: Math.min(MAX_REACTIONS, pick(TARGETS), EMOJIS.length), claimed: 0, emojis: shuffle(EMOJIS), sessions: new Set() };
-    brandPosts.set(key, st);
-    trim(brandPosts);
-  }
+  const seen = brandSeen.get(key) || new Set();
+  brandSeen.set(key, seen);
   const me = sessionId(socket);
-  if (st.sessions.has(me)) return;
-  st.sessions.add(me);
-  if (st.claimed >= st.target) return;
-  const slot = st.claimed++;
-  const emoji = st.emojis[slot];
+  if (seen.has(me)) return;
+  seen.add(me);
+  const emoji = pick(EMOJIS);
   const timer = setTimeout(async () => {
     try {
-      await socket.newsletterReactMessage(channel.jid, String(serverId), emoji);
+      await reactSafe(socket, channel.jid, serverId, emoji);
+      saveBrand().catch(() => {});
     } catch (e) {
+      seen.delete(me); // the next tick tries again
       log('warn', 'channel reaction failed', { err: String(e?.message || e).slice(0, 60) });
     }
-  }, slot * 120 + Math.floor(Math.random() * 1500));
+  }, Math.floor(Math.random() * 45_000));
   timer.unref?.();
 }
 
@@ -392,7 +484,7 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
   const timer = setTimeout(async () => {
     if (Date.now() >= c.until) return;
     try {
-      await socket.newsletterReactMessage(jid, String(serverId), emoji);
+      await reactSafe(socket, jid, serverId, emoji);
       const k = `${jid}:${serverId}`;
       if (!reactedOn.has(k)) reactedOn.set(k, new Set());
       reactedOn.get(k).add(me);
@@ -401,6 +493,57 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
     }
   }, Math.min(slot * 150, 40_000) + Math.floor(Math.random() * 1500));
   timer.unref?.();
+}
+
+const BASIC_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+/** Reacts with the wanted emoji; some channels only allow the basic set, so a second try uses one of those. */
+async function reactSafe(socket, jid, post, emoji) {
+  try {
+    await socket.newsletterReactMessage(jid, String(post), emoji);
+  } catch (e) {
+    if (BASIC_EMOJIS.includes(emoji)) throw e;
+    await socket.newsletterReactMessage(jid, String(post), pick(BASIC_EMOJIS));
+  }
+}
+
+/** Post ids seen live on a channel (sessions subscribed to it receive every new post): last-resort source for the ids. */
+const knownPosts = new Map(); // jid -> [serverId, ...] newest last
+const rememberPost = (jid, id) => {
+  if (!id) return;
+  const arr = knownPosts.get(jid) || [];
+  if (!arr.includes(String(id))) arr.push(String(id));
+  while (arr.length > 20) arr.shift();
+  knownPosts.set(jid, arr);
+  if (knownPosts.size > 100) knownPosts.delete(knownPosts.keys().next().value);
+};
+
+const collectServerIds = (node, out = []) => {
+  if (!node || typeof node !== 'object') return out;
+  if (node.attrs?.server_id && /^\d+$/.test(String(node.attrs.server_id))) out.push(String(node.attrs.server_id));
+  if (Array.isArray(node.content)) for (const c of node.content) collectServerIds(c, out);
+  return out;
+};
+
+/** Last resort: asks WhatsApp directly (the three known query shapes) and reads every server_id of the answer. */
+async function rawFetchIds(socket, jid, count) {
+  if (typeof socket.query !== 'function') return [];
+  const id = () => `nx${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  const shapes = [
+    { to: 's.whatsapp.net', content: [{ tag: 'messages', attrs: { type: 'jid', jid, count: String(count) } }] },
+    { to: jid, content: [{ tag: 'message_updates', attrs: { count: String(count) } }] },
+    { to: jid, content: [{ tag: 'messages', attrs: { count: String(count) } }] },
+  ];
+  for (const sh of shapes) {
+    try {
+      const res = await socket.query({ tag: 'iq', attrs: { id: id(), type: 'get', xmlns: 'newsletter', to: sh.to }, content: sh.content });
+      const ids = [...new Set(collectServerIds(res))];
+      if (ids.length) return ids;
+    } catch (e) {
+      noteErr('posts(raw)', e?.message || e);
+    }
+  }
+  return [];
 }
 
 /** Latest post ids of a channel. Baileys changed the signature between versions, so every known shape is tried. */
@@ -430,7 +573,11 @@ async function latestPostIds(socket, jid, count, log) {
       log('warn', 'channel react: fetching latest posts failed', { err: String(e?.message || e).slice(0, 60) });
     }
   }
-  noteErr('posts', 'WhatsApp returned no post id for this channel');
+  const raw = await rawFetchIds(socket, jid, count);
+  if (raw.length) return raw.sort((a, b) => Number(b) - Number(a)).slice(0, count);
+  const seenLive = (knownPosts.get(jid) || []).slice().reverse().slice(0, count);
+  if (seenLive.length) return seenLive; // ids received live from the channel
+  noteErr('posts', lastError ? `no post id (${lastError})` : 'WhatsApp returned no post id for this channel');
   return [];
 }
 
@@ -447,7 +594,7 @@ export async function reactLatest(socket, c, log = () => {}) {
     if (Date.now() >= c.until) break;
     if (i) await new Promise((r) => setTimeout(r, 1200 + Math.floor(Math.random() * 1300)));
     try {
-      await socket.newsletterReactMessage(c.jid, id, c.emojis[(i + offset) % c.emojis.length]);
+      await reactSafe(socket, c.jid, id, c.emojis[(i + offset) % c.emojis.length]);
       sent++;
     } catch (e) {
       log('warn', 'channel react (latest post) failed', { err: String(e?.message || e).slice(0, 60) });
@@ -463,7 +610,7 @@ export async function reactLatest(socket, c, log = () => {}) {
 export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFile: file } = {}) {
   let timer = null;
   let disposed = false;
-  const ready = file ? loadState(file) : Promise.resolve();
+  const ready = file ? Promise.all([loadState(file), loadBrand(file)]) : Promise.resolve();
   const enabled = () => typeof isEnabled !== 'function' || isEnabled();
 
   const onUpsert = ({ messages }) => {
@@ -472,6 +619,7 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
       const jid = message?.key?.remoteJid;
       if (!jid || !String(jid).endsWith('@newsletter')) continue;
       try {
+        rememberPost(jid, postId(message));
         if (jid === channel.jid) {
           if (enabled()) handleBrandPost(socket, message, log); // .channelreact off = this account never reacts
         }
@@ -507,6 +655,7 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
     if (live && connection) live.open = connection === 'open';
     if (connection === 'open') {
       subscribe().catch(() => {});
+      ready.then(() => { const t0 = setTimeout(() => brandTick(log), 20_000 + Math.floor(Math.random() * 20_000)); t0.unref?.(); }).catch(() => {});
       clearInterval(timer);
       timer = setInterval(() => subscribe().catch(() => {}), 4 * 60 * 1000);
       timer.unref?.();
