@@ -1,7 +1,7 @@
 // wa-newcmds.js — new commands (loaded by wa-extras.js)
 //
-//   ANIME     .animu <nom|poke|cry|kiss|pat|hug|wink|face-palm|quote>   (stickers, some-random-api)
-//   GAME      .game .rps .dice .flip .slot .8ball .guess .math
+//   ANIME     .mywaifu  — 8 waifu pictures as an album (waifu.im)
+//   GAME      .dungeon .tekateki .dinorun .pinzo .pixzo .xozo  (see wa-games.js)
 //   DOWNLOAD  .dl <link>  — video from (almost) any site: TikTok, Instagram, Facebook, X, YouTube, Pinterest, Reddit…
 //
 // Environment variables (all optional):
@@ -17,26 +17,24 @@ import path from 'node:path';
 import { box } from './wa-menu.js';
 import { imageToWebp, videoToWebp, addStickerMeta } from './media.js';
 import { isPublicHttps } from './wa-more.js';
+import { createGames } from './wa-games.js';
 
 const UA = 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36';
 
-/* ───────── ANIME (.animu) ───────── */
-export const ANIME_NAMES = ['animu'];
-const ANIMU_BASE = 'https://api.some-random-api.com/animu';
-const ANIMU_TYPES = ['nom', 'poke', 'cry', 'kiss', 'pat', 'hug', 'wink', 'face-palm', 'quote'];
-const ANIMU_ALIAS = { facepalm: 'face-palm', face_palm: 'face-palm', animuquote: 'quote', 'animu-quote': 'quote' };
+/* ───────── ANIME (.mywaifu) ───────── */
+export const ANIME_NAMES = ['mywaifu'];
+export const ANIME_ALIASES = { waifu: 'mywaifu', waifuim: 'mywaifu', waifus: 'mywaifu' };
 
 /* ───────── GROUP / SUDO / TOOLS ───────── */
 export const GROUP_NAMES = ['delete', 'hidetag', 'promote', 'demote'];
 export const SUDO_NAMES = ['sudo', 'delsudo'];
 export const TOOL_NAMES = ['remini'];
-export const NEW_ALIASES = { del: 'delete', ht: 'hidetag', rmsudo: 'delsudo', upscale: 'remini', hd: 'remini', url: 'tourl' };
+export const NEW_ALIASES = { ...ANIME_ALIASES, del: 'delete', ht: 'hidetag', rmsudo: 'delsudo', upscale: 'remini', hd: 'remini', url: 'tourl' };
 const RECENT_PER_CHAT = 60;
 const MAX_UPLOAD = 50 * 1024 * 1024;
 
-/* ───────── GAMES ───────── */
-export const GAME_NAMES = ['game', 'rps', 'dice', 'flip', 'slot', '8ball', 'guess', 'math'];
-const GAME_STATE_TTL_MS = 5 * 60_000;
+/* ───────── GAMES (see wa-games.js) ───────── */
+export { GAME_NAMES, GAME_ALIASES } from './wa-games.js';
 
 /* ───────── DOWNLOADER ───────── */
 export const DL_NAMES = ['dl'];
@@ -107,146 +105,57 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
     }
   };
 
-  /* ═════════════ ANIME (.animu) ═════════════ */
-  const animu = async ({ args, jid, m, reply }) => {
-    const raw = String(args[0] || '').toLowerCase();
-    const type = ANIMU_ALIAS[raw] || raw;
-    if (!type) return reply(box('🎌 ANIMU', [`Usage : *${P()}animu <type>*`, `Types : ${ANIMU_TYPES.join(', ')}`, `Example : *${P()}animu hug*`]));
-    if (!ANIMU_TYPES.includes(type)) return reply(box('❌ ANIMU', [`Unknown type : ${cut(type, 20)}`, `Types : ${ANIMU_TYPES.join(', ')}`]));
-    react(jid, m, '🎌');
+  /* ═════════════ ANIME (.mywaifu) ═════════════ */
+  const games = createGames({ sock, send, P, log });
+  const WAIFU_COUNT = 8;
+
+  async function waifuUrls() {
     try {
-      const data = await jget(`${ANIMU_BASE}/${type}`, { ms: 20_000 });
-      const link = data?.link;
-      if (link && isPublicHttps(link, true)) {
-        const gif = /\.gif(\?|$)/i.test(link);
-        // gif / image → sticker (same as the original command); if the conversion fails, the image is sent as it is
-        try {
-          const res = await fetchImpl(link, { signal: AbortSignal.timeout(20_000), headers: { 'user-agent': UA } });
-          if (!res.ok) throw new Error(`http ${res.status}`);
-          const buf = Buffer.from(await res.arrayBuffer());
-          const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), 'animu-'));
-          try {
-            const inP = path.join(tmp, gif ? 'in.gif' : 'in.img');
-            const outP = path.join(tmp, 'out.webp');
-            await fsp.writeFile(inP, buf);
-            if (gif) await videoToWebp(inP, outP, { seconds: 6 });
-            else await imageToWebp(inP, outP);
-            const webp = await addStickerMeta(await fsp.readFile(outP), { pack: 'Anime Stickers', author: process.env.BOT_NAME || 'NEXORA MD', emoji: '🎌' });
-            await send(jid, { sticker: webp }, m, true);
-          } finally {
-            fsp.rm(tmp, { recursive: true, force: true }).catch(() => {});
-          }
-          react(jid, m, '✅');
-          return null;
-        } catch (e) {
-          log('warn', 'animu sticker failed', { why: String(e?.message || '').slice(0, 60) });
-          await send(jid, { image: { url: link }, caption: `anime: ${type}` }, m, true);
-          react(jid, m, '✅');
-          return null;
-        }
-      }
-      if (data?.quote) {
-        await send(jid, String(data.quote).slice(0, 1500), m, true);
-        react(jid, m, '✅');
-        return null;
-      }
-      throw new Error('empty answer');
+      const params = new URLSearchParams({ isNsfw: 'false', orderBy: 'Random', page: '1', pageSize: String(WAIFU_COUNT) });
+      const data = await jget(`https://api.waifu.im/images?${params}`, { ms: 20_000 });
+      const urls = (data?.items || []).map((x) => x?.url).filter((u) => u && isPublicHttps(u, true));
+      if (urls.length) return urls;
     } catch (e) {
-      log('warn', 'animu failed', { why: String(e?.message || '').slice(0, 60) });
+      log('warn', 'waifu.im failed', { why: String(e?.message || '').slice(0, 60) });
+    }
+    // backup: waifu.pics (one picture per call)
+    const out = await Promise.allSettled(Array.from({ length: WAIFU_COUNT }, () => jget('https://api.waifu.pics/sfw/waifu', { ms: 15_000 })));
+    return out.map((r) => (r.status === 'fulfilled' ? r.value?.url : null)).filter((u) => u && isPublicHttps(u, true));
+  }
+
+  const mywaifu = async ({ args, jid, m, reply }) => {
+    if (/^n(sfw|ude)/i.test(String(args[0] || ''))) return reply(box('🌸 MYWAIFU', ['Only safe (SFW) pictures are available.', `Use : *${P()}mywaifu*`]));
+    react(jid, m, '🕕');
+    try {
+      const urls = (await waifuUrls()).slice(0, WAIFU_COUNT);
+      if (!urls.length) throw new Error('no picture');
+      await send(jid, box('🌸 MYWAIFU', [`${urls.length} waifu pictures for you ✨`]), m, true);
+      let album = false;
+      try {
+        const { generateWAMessageFromContent, generateWAMessage, jidNormalizedUser } = await import('@whiskeysockets/baileys');
+        const { randomBytes } = await import('node:crypto');
+        const opener = generateWAMessageFromContent(jid, {
+          messageContextInfo: { messageSecret: randomBytes(32) },
+          albumMessage: { expectedImageCount: urls.length, expectedVideoCount: 0 },
+        }, { userJid: jidNormalizedUser(sock.user.id), quoted: m, upload: sock.waUploadToServer });
+        await sock.relayMessage(opener.key.remoteJid, opener.message, { messageId: opener.key.id });
+        for (const url of urls) {
+          const msg = await generateWAMessage(opener.key.remoteJid, { image: { url } }, { upload: sock.waUploadToServer });
+          msg.message.messageContextInfo = { messageSecret: randomBytes(32), messageAssociation: { associationType: 1, parentMessageKey: opener.key } };
+          await sock.relayMessage(msg.key.remoteJid, msg.message, { messageId: msg.key.id });
+        }
+        album = true;
+      } catch (e) {
+        log('warn', 'waifu album failed, sending one by one', { why: String(e?.message || '').slice(0, 60) });
+      }
+      if (!album) for (const url of urls.slice(0, 5)) await send(jid, { image: { url } }, m, true);
+      react(jid, m, '✅');
+    } catch (e) {
+      log('warn', 'mywaifu failed', { why: String(e?.message || '').slice(0, 60) });
       react(jid, m, '❌');
-      return reply(box('❌ ANIMU', ['Failed to fetch animu. Try again.']));
+      return reply(box('❌ MYWAIFU', ['Could not get pictures right now. Try again in a minute.']));
     }
-  };
-
-  /* ═════════════ GAMES ═════════════ */
-  const states = new Map(); // "chat|user|game" -> { until, ... }
-  const who = (jid, m) => `${jid}|${m.key?.participant || (m.key?.fromMe ? 'me' : jid)}`;
-  const getState = (jid, m, game) => {
-    const k = `${who(jid, m)}|${game}`;
-    const s = states.get(k);
-    if (s && Date.now() > s.until) { states.delete(k); return null; }
-    return s || null;
-  };
-  const setState = (jid, m, game, data) => {
-    if (states.size > 500) states.delete(states.keys().next().value);
-    states.set(`${who(jid, m)}|${game}`, { ...data, until: Date.now() + GAME_STATE_TTL_MS });
-  };
-  const clearState = (jid, m, game) => states.delete(`${who(jid, m)}|${game}`);
-
-  const game = ({ reply }) =>
-    reply(box('🎮 GAMES', [
-      `${P()}rps <rock|paper|scissors> — play against the bot`,
-      `${P()}dice — roll a dice`,
-      `${P()}flip — heads or tails`,
-      `${P()}slot — slot machine`,
-      `${P()}8ball <question> — ask the magic ball`,
-      `${P()}guess — guess a number from 1 to 20`,
-      `${P()}math — quick calculation challenge`,
-    ]));
-
-  const RPS = { rock: '🪨', paper: '📄', scissors: '✂️' };
-  const RPS_ALIAS = { r: 'rock', p: 'paper', s: 'scissors', pierre: 'rock', feuille: 'paper', ciseaux: 'scissors', wòch: 'rock', papye: 'paper', sizo: 'scissors' };
-  const rps = ({ args, reply }) => {
-    const a = String(args[0] || '').toLowerCase();
-    const mine = RPS[a] ? a : RPS_ALIAS[a];
-    if (!mine) return reply(box('🎮 ROCK PAPER SCISSORS', [`Usage : *${P()}rps rock* · *paper* · *scissors*`]));
-    const bot = pickOne(Object.keys(RPS));
-    const win = { rock: 'scissors', paper: 'rock', scissors: 'paper' };
-    const res = mine === bot ? '🤝 Draw' : win[mine] === bot ? '🏆 You win!' : '😈 I win!';
-    return reply(box('🎮 ROCK PAPER SCISSORS', [`You : ${RPS[mine]} ${mine}`, `Bot : ${RPS[bot]} ${bot}`, res]));
-  };
-
-  const dice = ({ reply }) => reply(box('🎲 DICE', [`You rolled : *${1 + Math.floor(Math.random() * 6)}*`]));
-  const flip = ({ reply }) => reply(box('🪙 COIN', [Math.random() < 0.5 ? 'Heads 🙂' : 'Tails 🦅']));
-
-  const SLOT = ['🍒', '🍋', '🍉', '⭐', '💎', '7️⃣'];
-  const slot = ({ reply }) => {
-    const r = [pickOne(SLOT), pickOne(SLOT), pickOne(SLOT)];
-    const same = new Set(r).size;
-    const res = same === 1 ? '🎉 JACKPOT!' : same === 2 ? '😮 Almost… two match' : '😅 No luck, try again';
-    return reply(box('🎰 SLOT', [`| ${r.join(' | ')} |`, res]));
-  };
-
-  const BALL = ['Yes ✅', 'No ❌', 'Maybe 🤔', 'Definitely 💯', 'Ask again later ⏳', 'I doubt it 😬', 'Without a doubt 🔥', 'Very unlikely 🧊'];
-  const ball = ({ q, reply }) => {
-    if (!q) return reply(box('🎱 8BALL', [`Usage : *${P()}8ball <question>*`]));
-    return reply(box('🎱 8BALL', [`Q : ${cut(q, 100)}`, `A : *${pickOne(BALL)}*`]));
-  };
-
-  const guess = ({ args, jid, m, reply }) => {
-    const st = getState(jid, m, 'guess');
-    const n = Number.parseInt(args[0], 10);
-    if (!st) {
-      setState(jid, m, 'guess', { secret: 1 + Math.floor(Math.random() * 20), tries: 5 });
-      if (!Number.isFinite(n)) return reply(box('🔢 GUESS', ['I picked a number from 1 to 20.', 'You have *5* tries.', `Play : *${P()}guess <number>*`]));
-    }
-    const cur = getState(jid, m, 'guess');
-    if (!Number.isFinite(n) || n < 1 || n > 20) return reply(box('🔢 GUESS', [`Send a number from 1 to 20: *${P()}guess 7*`]));
-    cur.tries -= 1;
-    if (n === cur.secret) {
-      clearState(jid, m, 'guess');
-      return reply(box('🔢 GUESS', [`🎉 Correct! It was *${cur.secret}*.`]));
-    }
-    if (cur.tries <= 0) {
-      clearState(jid, m, 'guess');
-      return reply(box('🔢 GUESS', [`💀 Game over. It was *${cur.secret}*.`]));
-    }
-    return reply(box('🔢 GUESS', [n < cur.secret ? 'Higher ⬆️' : 'Lower ⬇️', `Tries left : *${cur.tries}*`]));
-  };
-
-  const math = ({ args, jid, m, reply }) => {
-    const st = getState(jid, m, 'math');
-    const ans = args[0] != null && args[0] !== '' ? Number(args[0]) : NaN;
-    if (st && Number.isFinite(ans)) {
-      clearState(jid, m, 'math');
-      return reply(box('➕ MATH', [ans === st.answer ? '🎉 Correct!' : `❌ Wrong. The answer was *${st.answer}*.`]));
-    }
-    const a = 2 + Math.floor(Math.random() * 40);
-    const b = 2 + Math.floor(Math.random() * 12);
-    const op = pickOne(['+', '-', '×']);
-    const answer = op === '+' ? a + b : op === '-' ? a - b : a * b;
-    setState(jid, m, 'math', { answer });
-    return reply(box('➕ MATH', [`${a} ${op} ${b} = ?`, `Answer with *${P()}math <number>* (5 min).`]));
+    return null;
   };
 
   /* ═════════════ DOWNLOADER ═════════════ */
@@ -655,12 +564,12 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
   };
 
   const handlers = {
-    animu,
-    game, rps, dice, flip, slot, '8ball': ball, guess, math,
+    mywaifu,
+    ...games.handlers,
     dl,
     delete: del, hidetag, promote: promoteDemote('promote'), demote: promoteDemote('demote'),
     sudo, delsudo,
     tourl, remini,
   };
-  return { handlers, track, isSudo };
+  return { handlers, track, isSudo, gameText: games.onText };
 }
