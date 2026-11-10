@@ -1,0 +1,1117 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+
+<title>Tic Tac Toe</title>
+
+<style>
+*{
+  box-sizing:border-box;
+  -webkit-tap-highlight-color:transparent;
+}
+
+html{
+  width:100%;
+  min-height:100%;
+  background:transparent;
+  overflow-x:hidden;
+  overflow-y:auto;
+}
+
+body{
+  margin:0;
+  width:100%;
+  min-height:100vh;
+  background:transparent;
+  color:#fff;
+  font-family:Arial,sans-serif;
+  display:flex;
+  justify-content:center;
+  align-items:flex-start;
+  overflow-x:hidden;
+  overflow-y:auto;
+}
+
+.game{
+  width:100%;
+  max-width:520px;
+  padding:20px;
+  margin:0 auto;
+}
+
+h1{
+  width:100%;
+  text-align:center;
+  margin:0;
+  font-size:32px;
+  letter-spacing:1px;
+}
+
+.subtitle{
+  width:100%;
+  text-align:center;
+  color:#777;
+  margin:6px 0 20px;
+  font-size:13px;
+}
+
+.menu{
+  width:100%;
+  max-width:460px;
+  margin:0 auto;
+  display:grid;
+  gap:12px;
+}
+
+label{
+  display:block;
+  width:100%;
+  color:#999;
+  font-size:12px;
+  text-align:left;
+}
+
+select,
+button{
+  width:100%;
+  border:0;
+  outline:none;
+  border-radius:12px;
+  padding:14px;
+  font-size:16px;
+  font-weight:bold;
+}
+
+select{
+  display:block;
+  width:100%;
+  background:#171922;
+  color:#fff;
+  border:1px solid #292c38;
+}
+
+#start{
+  margin-top:5px;
+  background:#5b7cff;
+  color:#fff;
+}
+
+button{
+  cursor:pointer;
+}
+
+button:active{
+  transform:scale(.96);
+}
+
+.hidden{
+  display:none;
+}
+
+#gameArea{
+  width:100%;
+}
+
+.score{
+  width:100%;
+  display:grid;
+  grid-template-columns:1fr 1fr 1fr;
+  gap:8px;
+  margin:15px 0;
+}
+
+.scoreBox{
+  width:100%;
+  background:#13151c;
+  border:1px solid #252833;
+  border-radius:12px;
+  padding:10px 5px;
+  text-align:center;
+}
+
+.scoreBox small{
+  display:block;
+  color:#777;
+  font-size:10px;
+  margin-bottom:5px;
+}
+
+.scoreBox strong{
+  font-size:22px;
+}
+
+.status{
+  width:100%;
+  height:24px;
+  text-align:center;
+  color:#aaa;
+  font-size:14px;
+  margin-bottom:10px;
+  transition:.25s;
+}
+
+.status.win{
+  color:#5bff9b;
+  animation:statusWin .6s infinite alternate;
+}
+
+.status.lose{
+  color:#ff5577;
+  animation:statusLose .6s infinite alternate;
+}
+
+.status.draw{
+  color:#ffd45b;
+}
+
+@keyframes statusWin{
+  from{
+    transform:scale(1);
+  }
+
+  to{
+    transform:scale(1.12);
+  }
+}
+
+@keyframes statusLose{
+  from{
+    transform:scale(1);
+  }
+
+  to{
+    transform:scale(1.08);
+  }
+}
+
+.board{
+  width:min(90vw,460px);
+  aspect-ratio:1;
+  margin:10px auto 0;
+  padding:5px;
+  gap:5px;
+  display:grid;
+  background:#252833;
+  border-radius:15px;
+}
+
+.cell{
+  position:relative;
+  border:0;
+  padding:0;
+  background:#11131a;
+  color:#fff;
+  border-radius:7px;
+  display:flex;
+  justify-content:center;
+  align-items:center;
+  font-weight:bold;
+  font-size:clamp(20px,8vw,52px);
+  user-select:none;
+  overflow:hidden;
+}
+
+.cell.x{
+  color:#5b7cff;
+}
+
+.cell.o{
+  color:#ff5577;
+}
+
+.cell.pop{
+  animation:pop .25s ease-out;
+}
+
+@keyframes pop{
+  0%{
+    transform:scale(.4);
+    opacity:0;
+  }
+
+  70%{
+    transform:scale(1.15);
+  }
+
+  100%{
+    transform:scale(1);
+    opacity:1;
+  }
+}
+
+.cell.win{
+  background:#26352f;
+  animation:winCell .55s ease-in-out infinite alternate;
+  z-index:2;
+}
+
+@keyframes winCell{
+  from{
+    transform:scale(1);
+    filter:brightness(1);
+  }
+
+  to{
+    transform:scale(.9);
+    filter:brightness(1.8);
+  }
+}
+
+.board.shake{
+  animation:shake .4s ease;
+}
+
+@keyframes shake{
+  0%,100%{
+    transform:translateX(0);
+  }
+
+  20%{
+    transform:translateX(-8px);
+  }
+
+  40%{
+    transform:translateX(8px);
+  }
+
+  60%{
+    transform:translateX(-6px);
+  }
+
+  80%{
+    transform:translateX(6px);
+  }
+}
+
+.actions{
+  width:min(90vw,460px);
+  margin:15px auto 30px;
+}
+
+#menuBtn{
+  display:block;
+  width:100%;
+  background:#171922;
+  color:#fff;
+  border:1px solid #292c38;
+}
+
+.confetti{
+  position:fixed;
+  width:7px;
+  height:7px;
+  pointer-events:none;
+  z-index:99;
+  animation:confettiFall 1.2s linear forwards;
+}
+
+@keyframes confettiFall{
+  0%{
+    transform:translateY(-20px) rotate(0);
+    opacity:1;
+  }
+
+  100%{
+    transform:translateY(100vh) rotate(720deg);
+    opacity:0;
+  }
+}
+
+@media(max-width:400px){
+
+  .game{
+    width:100%;
+    max-width:520px;
+    padding:16px 12px 30px;
+    margin:0 auto;
+  }
+
+  h1{
+    font-size:27px;
+  }
+
+  .menu{
+    width:100%;
+    max-width:460px;
+    margin-left:auto;
+    margin-right:auto;
+  }
+
+  .board{
+    width:90vw;
+    max-width:460px;
+    margin-left:auto;
+    margin-right:auto;
+  }
+
+  .actions{
+    width:90vw;
+    max-width:460px;
+    margin-left:auto;
+    margin-right:auto;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<div class="game">
+
+  <h1>TIC TAC TOE</h1>
+
+  <div class="subtitle">
+    USER VS ROBOT
+  </div>
+
+  <div id="menu" class="menu">
+
+    <label>MODE</label>
+
+    <select id="mode">
+      <option value="easy">EASY</option>
+      <option value="medium">MEDIUM</option>
+      <option value="hard">HARD</option>
+    </select>
+
+    <label>BLOCK</label>
+
+    <select id="size">
+      <option value="3">3 × 3</option>
+      <option value="4">4 × 4</option>
+      <option value="8">8 × 8</option>
+    </select>
+
+    <button id="start">
+      START
+    </button>
+
+  </div>
+
+  <div id="gameArea" class="hidden">
+
+    <div class="score">
+
+      <div class="scoreBox">
+        <small>YOU</small>
+        <strong id="userScore">0</strong>
+      </div>
+
+      <div class="scoreBox">
+        <small>DRAW</small>
+        <strong id="drawScore">0</strong>
+      </div>
+
+      <div class="scoreBox">
+        <small>ROBOT</small>
+        <strong id="robotScore">0</strong>
+      </div>
+
+    </div>
+
+    <div id="status" class="status">
+      Giliran kamu
+    </div>
+
+    <div id="board" class="board"></div>
+
+    <div class="actions">
+      <button id="menuBtn">
+        MENU
+      </button>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+const menu = document.getElementById("menu");
+const gameArea = document.getElementById("gameArea");
+const boardEl = document.getElementById("board");
+const statusEl = document.getElementById("status");
+
+const modeEl = document.getElementById("mode");
+const sizeEl = document.getElementById("size");
+
+const userScoreEl = document.getElementById("userScore");
+const robotScoreEl = document.getElementById("robotScore");
+const drawScoreEl = document.getElementById("drawScore");
+
+let size = 3;
+let board = [];
+let gameOver = false;
+let playerTurn = true;
+let mode = "easy";
+
+let score = {
+  user:0,
+  robot:0,
+  draw:0
+};
+
+let audioCtx = null;
+
+function audioStart(){
+
+  if(!audioCtx){
+
+    audioCtx =
+      new (window.AudioContext ||
+      window.webkitAudioContext)();
+
+  }
+
+  if(audioCtx.state === "suspended"){
+    audioCtx.resume();
+  }
+}
+
+function sound(type){
+
+  audioStart();
+
+  const osc =
+    audioCtx.createOscillator();
+
+  const gain =
+    audioCtx.createGain();
+
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+
+  let freq = 500;
+  let duration = .08;
+
+  if(type === "click"){
+    freq = 520;
+    duration = .07;
+  }
+
+  if(type === "robot"){
+    freq = 360;
+    duration = .09;
+  }
+
+  if(type === "win"){
+    freq = 700;
+    duration = .18;
+  }
+
+  if(type === "lose"){
+    freq = 180;
+    duration = .25;
+  }
+
+  if(type === "draw"){
+    freq = 420;
+    duration = .15;
+  }
+
+  osc.frequency.setValueAtTime(
+    freq,
+    audioCtx.currentTime
+  );
+
+  if(type === "win"){
+
+    osc.frequency.exponentialRampToValueAtTime(
+      1100,
+      audioCtx.currentTime + duration
+    );
+
+  }
+
+  if(type === "lose"){
+
+    osc.frequency.exponentialRampToValueAtTime(
+      80,
+      audioCtx.currentTime + duration
+    );
+
+  }
+
+  gain.gain.setValueAtTime(
+    .0001,
+    audioCtx.currentTime
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    .12,
+    audioCtx.currentTime + .01
+  );
+
+  gain.gain.exponentialRampToValueAtTime(
+    .0001,
+    audioCtx.currentTime + duration
+  );
+
+  osc.start();
+
+  osc.stop(
+    audioCtx.currentTime +
+    duration +
+    .02
+  );
+}
+
+document.getElementById("start").onclick = () => {
+
+  audioStart();
+
+  mode = modeEl.value;
+  size = Number(sizeEl.value);
+
+  menu.classList.add("hidden");
+  gameArea.classList.remove("hidden");
+
+  updateScore();
+
+  newGame();
+};
+
+document.getElementById("menuBtn").onclick = () => {
+
+  gameArea.classList.add("hidden");
+  menu.classList.remove("hidden");
+
+};
+
+function newGame(){
+
+  board =
+    Array(size * size).fill("");
+
+  gameOver = false;
+  playerTurn = true;
+
+  boardEl.style.gridTemplateColumns =
+    `repeat(${size},1fr)`;
+
+  statusEl.className = "status";
+  statusEl.textContent = "Giliran kamu";
+
+  drawBoard();
+}
+
+function drawBoard(){
+
+  boardEl.innerHTML = "";
+
+  board.forEach((value,index)=>{
+
+    const cell =
+      document.createElement("button");
+
+    cell.className = "cell";
+
+    if(value === "X"){
+      cell.classList.add("x");
+    }
+
+    if(value === "O"){
+      cell.classList.add("o");
+    }
+
+    cell.textContent = value;
+
+    cell.onclick = () => {
+      playerMove(index);
+    };
+
+    boardEl.appendChild(cell);
+
+  });
+}
+
+function playerMove(index){
+
+  if(
+    gameOver ||
+    !playerTurn ||
+    board[index] !== ""
+  ){
+    return;
+  }
+
+  audioStart();
+
+  sound("click");
+
+  board[index] = "X";
+
+  playerTurn = false;
+
+  drawBoard();
+
+  const cell =
+    boardEl.children[index];
+
+  if(cell){
+    cell.classList.add("pop");
+  }
+
+  if(checkGame()){
+    return;
+  }
+
+  statusEl.className = "status";
+  statusEl.textContent =
+    "Robot berpikir...";
+
+  setTimeout(()=>{
+    robotMove();
+  },mode === "easy" ? 300 : 500);
+}
+
+function robotMove(){
+
+  if(gameOver){
+    return;
+  }
+
+  let move;
+
+  if(mode === "easy"){
+    move = randomMove();
+  }
+
+  else if(mode === "medium"){
+    move = mediumMove();
+  }
+
+  else{
+    move = hardMove();
+  }
+
+  if(move !== undefined){
+
+    board[move] = "O";
+
+    sound("robot");
+  }
+
+  drawBoard();
+
+  if(move !== undefined){
+
+    const cell =
+      boardEl.children[move];
+
+    if(cell){
+      cell.classList.add("pop");
+    }
+
+  }
+
+  if(checkGame()){
+    return;
+  }
+
+  playerTurn = true;
+
+  statusEl.className = "status";
+  statusEl.textContent =
+    "Giliran kamu";
+}
+
+function randomMove(){
+
+  const empty = [];
+
+  board.forEach((v,i)=>{
+
+    if(v === ""){
+      empty.push(i);
+    }
+
+  });
+
+  if(!empty.length){
+    return undefined;
+  }
+
+  return empty[
+    Math.floor(
+      Math.random() * empty.length
+    )
+  ];
+}
+
+function mediumMove(){
+
+  const win =
+    findWinningMove("O");
+
+  if(win !== undefined){
+    return win;
+  }
+
+  const block =
+    findWinningMove("X");
+
+  if(block !== undefined){
+    return block;
+  }
+
+  if(Math.random() < .6){
+    return strategicMove();
+  }
+
+  return randomMove();
+}
+
+function hardMove(){
+
+  const win =
+    findWinningMove("O");
+
+  if(win !== undefined){
+    return win;
+  }
+
+  const block =
+    findWinningMove("X");
+
+  if(block !== undefined){
+    return block;
+  }
+
+  return strategicMove();
+}
+
+function findWinningMove(symbol){
+
+  for(let i=0;i<board.length;i++){
+
+    if(board[i] !== ""){
+      continue;
+    }
+
+    board[i] = symbol;
+
+    const result =
+      getWinner();
+
+    board[i] = "";
+
+    if(result === symbol){
+      return i;
+    }
+
+  }
+
+  return undefined;
+}
+
+function strategicMove(){
+
+  const center =
+    Math.floor(board.length / 2);
+
+  if(board[center] === ""){
+    return center;
+  }
+
+  const positions = [];
+
+  if(size === 3){
+
+    positions.push(
+      0,
+      2,
+      6,
+      8
+    );
+
+  }else{
+
+    positions.push(
+      0,
+      size - 1,
+      size * (size - 1),
+      size * size - 1
+    );
+
+  }
+
+  const available =
+    positions.filter(
+      i => board[i] === ""
+    );
+
+  if(available.length){
+
+    return available[
+      Math.floor(
+        Math.random() *
+        available.length
+      )
+    ];
+
+  }
+
+  return randomMove();
+}
+
+function getLines(){
+
+  const lines = [];
+
+  for(let r=0;r<size;r++){
+
+    const line = [];
+
+    for(let c=0;c<size;c++){
+
+      line.push(
+        r * size + c
+      );
+
+    }
+
+    lines.push(line);
+  }
+
+  for(let c=0;c<size;c++){
+
+    const line = [];
+
+    for(let r=0;r<size;r++){
+
+      line.push(
+        r * size + c
+      );
+
+    }
+
+    lines.push(line);
+  }
+
+  const diag1 = [];
+  const diag2 = [];
+
+  for(let i=0;i<size;i++){
+
+    diag1.push(
+      i * size + i
+    );
+
+    diag2.push(
+      i * size +
+      (size - 1 - i)
+    );
+
+  }
+
+  lines.push(diag1);
+  lines.push(diag2);
+
+  return lines;
+}
+
+function getWinner(){
+
+  const lines =
+    getLines();
+
+  for(const line of lines){
+
+    const first =
+      board[line[0]];
+
+    if(first === ""){
+      continue;
+    }
+
+    if(
+      line.every(
+        i => board[i] === first
+      )
+    ){
+      return first;
+    }
+
+  }
+
+  if(
+    board.every(
+      v => v !== ""
+    )
+  ){
+    return "DRAW";
+  }
+
+  return null;
+}
+
+function checkGame(){
+
+  const result =
+    getWinner();
+
+  if(!result){
+    return false;
+  }
+
+  gameOver = true;
+
+  if(result === "X"){
+
+    score.user++;
+
+    statusEl.className =
+      "status win";
+
+    statusEl.textContent =
+      "KAMU MENANG!";
+
+    highlightWinner("X");
+
+    sound("win");
+
+    createConfetti();
+
+  }
+
+  else if(result === "O"){
+
+    score.robot++;
+
+    statusEl.className =
+      "status lose";
+
+    statusEl.textContent =
+      "ROBOT MENANG!";
+
+    highlightWinner("O");
+
+    sound("lose");
+
+    boardEl.classList.add(
+      "shake"
+    );
+
+    setTimeout(()=>{
+      boardEl.classList.remove(
+        "shake"
+      );
+    },500);
+
+  }
+
+  else{
+
+    score.draw++;
+
+    statusEl.className =
+      "status draw";
+
+    statusEl.textContent =
+      "SERI!";
+
+    sound("draw");
+
+    boardEl.classList.add(
+      "shake"
+    );
+
+    setTimeout(()=>{
+      boardEl.classList.remove(
+        "shake"
+      );
+    },500);
+
+  }
+
+  updateScore();
+
+  setTimeout(()=>{
+    newGame();
+  },1700);
+
+  return true;
+}
+
+function highlightWinner(symbol){
+
+  const lines =
+    getLines();
+
+  for(const line of lines){
+
+    if(
+      line.every(
+        i => board[i] === symbol
+      )
+    ){
+
+      line.forEach(i=>{
+
+        const cell =
+          boardEl.children[i];
+
+        if(cell){
+          cell.classList.add(
+            "win"
+          );
+        }
+
+      });
+
+      break;
+    }
+
+  }
+}
+
+function createConfetti(){
+
+  for(let i=0;i<55;i++){
+
+    const piece =
+      document.createElement("div");
+
+    piece.className =
+      "confetti";
+
+    piece.style.left =
+      Math.random() * 100 + "vw";
+
+    piece.style.top =
+      "-10px";
+
+    piece.style.animationDelay =
+      Math.random() * .4 + "s";
+
+    piece.style.transform =
+      `rotate(${Math.random()*360}deg)`;
+
+    document.body.appendChild(
+      piece
+    );
+
+    setTimeout(()=>{
+      piece.remove();
+    },1700);
+
+  }
+}
+
+function updateScore(){
+
+  userScoreEl.textContent =
+    score.user;
+
+  robotScoreEl.textContent =
+    score.robot;
+
+  drawScoreEl.textContent =
+    score.draw;
+}
+</script>
+
+</body>
+</html>
