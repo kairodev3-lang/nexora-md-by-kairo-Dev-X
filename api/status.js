@@ -1,7 +1,7 @@
 // GET /api/status?phone=...  ->  { ok, state }   (state only, never the number)
-const { PHONE_RE, webId, backend, limited } = require('./_lib');
+import { PHONE_RE, webId, backend, limited } from './_lib.js';
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   res.setHeader('cache-control', 'no-store');
   const phone = String((req.query && req.query.phone) || '').replace(/\D/g, '');
   if (!PHONE_RE.test(phone)) return res.status(400).json({ ok: false });
@@ -12,4 +12,4 @@ module.exports = async (req, res) => {
   } catch (e) {
     return res.status(502).json({ ok: false });
   }
-};
+}
