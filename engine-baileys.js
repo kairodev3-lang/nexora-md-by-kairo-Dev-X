@@ -240,6 +240,9 @@ export async function createBaileysEngine() {
             // "1" / "2" after .play: audio / video of the song that was shown
             if (/^[12]$/.test(text) && (await extras.playChoice(text, { jid, m, reply, content, isOwner }))) continue;
 
+            // plain text that answers a running game (.dungeon, .tekateki)
+            if (extras.gameText && (await extras.gameText(text, { jid, m, reply }))) continue;
+
             // current prefix; ".setprefix" always works (backup if the prefix is forgotten)
             const prefix = extras.settings.prefix;
             const used = text.startsWith(prefix) ? prefix : isOwner && /^\.setprefix(\s|$)/i.test(text) ? '.' : null;
