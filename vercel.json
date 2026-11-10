@@ -1,3 +1,4 @@
 {
+  "installCommand": "echo skip",
   "functions": { "api/*.js": { "maxDuration": 60 } }
 }
