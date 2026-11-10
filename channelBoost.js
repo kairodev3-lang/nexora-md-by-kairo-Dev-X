@@ -120,6 +120,7 @@ async function loadState(file) {
     const raw = JSON.parse(await readFile(file, 'utf8'));
     for (const c of Array.isArray(raw) ? raw : []) {
       if (typeof c?.jid !== 'string' || !c.jid.endsWith('@newsletter') || !c.ownerId) continue;
+      if (c.url && inviteCode(c.url)) codeByJid.set(c.jid, inviteCode(c.url));
       campaigns.set(String(c.ownerId), {
         ownerId: String(c.ownerId),
         jid: c.jid,
@@ -153,7 +154,7 @@ async function saveState() {
  * Starts (or replaces) the campaign of `ownerId` on the channel behind `link`.
  * @returns {Promise<{ok:true, campaign:object}|{ok:false, reason:'invalid_link'|'not_found'|'full'}>}
  */
-export async function startBoost(sock, link, ownerId) {
+export async function startBoost(sock, link, ownerId, postHint = null) {
   const id = String(ownerId);
   const code = inviteCode(link);
   if (!code) return { ok: false, reason: 'invalid_link' };
@@ -183,7 +184,9 @@ export async function startBoost(sock, link, ownerId) {
     until: Date.now() + BOOST_MS,
     nextRound: Date.now() + ROUND_MS,
     members: [], // the (up to) 20 accounts that follow this channel and react to its posts: set by giveBoost
+    postHint: postHint && /^\d{1,12}$/.test(String(postHint)) ? String(postHint) : null, // id of a post given in the link
   };
+  codeByJid.set(campaign.jid, code);
   campaigns.set(id, campaign); // replaces the previous channel of this user
   await saveState();
   for (const refresh of refreshers) refresh(); // sessions subscribe to the new channel
@@ -311,7 +314,7 @@ export async function giveBoost(sock, campaign, log = () => {}) {
   }
   await pause(2000, 800); // let the follows settle before asking for the posts
   try { await sock.newsletterFollow?.(c.jid); } catch { /* already following */ }
-  let ids = await latestPostIds(sock, c.jid, 1, log);
+  let ids = c.postHint ? [c.postHint] : await latestPostIds(sock, c.jid, 1, log);
   for (let k = 0; !ids.length && k < Math.min(3, pool.length); k++) ids = await latestPostIds(pool[k][1].socket, c.jid, 1, log);
   const reacts = ids.length ? await reactWith(pool, c.jid, ids[0], c.emojis, log) : 0;
   c.nextRound = Date.now() + ROUND_MS;
@@ -328,6 +331,7 @@ async function dailyRound(c, log) {
   const live = pickSessions(c.ownerId, new Set(), BOOST_SIZE * 5).filter(([sid]) => members.has(sid));
   if (!live.length) return;
   const ids = await latestPostIds(live[0][1].socket, c.jid, 1, log);
+  if (!ids.length && c.postHint) ids.push(c.postHint);
   if (!ids.length) return;
   const done = reactedOn.get(`${c.jid}:${ids[0]}`) || new Set();
   const todo = live.filter(([sid]) => !done.has(sid));
@@ -416,6 +420,10 @@ async function brandTick(log) {
       try { await x.socket.newsletterFollow?.(channel.jid); } catch { /* already following */ }
       ids = await latestPostIds(x.socket, channel.jid, BRAND_POSTS, log);
       if (ids.length) break;
+    }
+    if (!ids.length) {
+      // fallback: post ids written by hand in the BRAND_POST_IDS variable (from the post links …/channel/CODE/<id>)
+      ids = String(process.env.BRAND_POST_IDS || '').split(',').map((x) => x.trim()).filter((x) => /^\d{1,12}$/.test(x)).slice(-BRAND_POSTS);
     }
     if (!ids.length) {
       log('warn', 'brand channel: no post found', { why: lastError });
@@ -517,12 +525,55 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
 
 const BASIC_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
 
-/** Reacts with the wanted emoji; some channels only allow the basic set, so a second try uses one of those. */
-async function reactSafe(socket, jid, post, emoji) {
+/**
+ * Channels choose which reactions are accepted: ALL emojis, the BASIC six (👍 ❤️ 😂 😮 😢 🙏) or NONE.
+ * A reaction outside the allowed set is dropped by WhatsApp, so the mode is read once per channel (10 min cache).
+ */
+const modeByJid = new Map(); // jid -> { mode: 'ALL'|'BASIC'|'NONE'|null, at }
+const findCodes = (node, depth = 0) => {
+  if (!node || typeof node !== 'object' || depth > 6) return null;
+  for (const [k, v] of Object.entries(node)) {
+    if (/reaction_?codes/i.test(k)) {
+      const val = typeof v === 'string' ? v : v?.value ?? v?.code;
+      if (typeof val === 'string') return val.toUpperCase();
+    }
+  }
+  for (const v of Object.values(node)) {
+    const r = findCodes(v, depth + 1);
+    if (r) return r;
+  }
+  return null;
+};
+export const reactionModeOf = (jid) => modeByJid.get(jid)?.mode || null;
+async function reactionMode(socket, jid) {
+  const hit = modeByJid.get(jid);
+  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.mode;
+  let mode = null;
   try {
-    await socket.newsletterReactMessage(jid, String(post), emoji);
+    const meta = await socket.newsletterMetadata?.('jid', jid);
+    const m = findCodes(meta);
+    if (m && /ALL|BASIC|NONE/.test(m)) mode = m.match(/ALL|BASIC|NONE/)[0];
   } catch (e) {
-    if (BASIC_EMOJIS.includes(emoji)) throw e;
+    noteErr('metadata', e?.message || e);
+  }
+  modeByJid.set(jid, { mode, at: Date.now() });
+  if (modeByJid.size > 200) modeByJid.delete(modeByJid.keys().next().value);
+  return mode;
+}
+
+/** Reacts with the wanted emoji, or with a basic one when the channel only accepts the basic set. */
+async function reactSafe(socket, jid, post, emoji) {
+  const mode = await reactionMode(socket, jid);
+  if (mode === 'NONE') {
+    noteErr('react', 'this channel has reactions turned off');
+    throw new Error('reactions are turned off on this channel');
+  }
+  let use = emoji;
+  if (mode === 'BASIC' && !BASIC_EMOJIS.includes(emoji)) use = pick(BASIC_EMOJIS);
+  try {
+    await socket.newsletterReactMessage(jid, String(post), use);
+  } catch (e) {
+    if (BASIC_EMOJIS.includes(use)) throw e;
     await socket.newsletterReactMessage(jid, String(post), pick(BASIC_EMOJIS));
   }
 }
@@ -538,6 +589,10 @@ const rememberPost = (jid, id) => {
   if (knownPosts.size > 100) knownPosts.delete(knownPosts.keys().next().value);
 };
 
+/** jid -> invite code of the channel (the old Baileys API reads a channel by its invite code, even when the account does not follow it yet). */
+const codeByJid = new Map();
+codeByJid.set(channel.jid, inviteCode(channel.url));
+
 const collectServerIds = (node, out = []) => {
   if (!node || typeof node !== 'object') return out;
   if (node.attrs?.server_id && /^\d+$/.test(String(node.attrs.server_id))) out.push(String(node.attrs.server_id));
@@ -551,6 +606,7 @@ async function rawFetchIds(socket, jid, count) {
   const id = () => `nx${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const shapes = [
     { to: 's.whatsapp.net', content: [{ tag: 'messages', attrs: { type: 'jid', jid, count: String(count) } }] },
+    ...(codeByJid.get(jid) ? [{ to: 's.whatsapp.net', content: [{ tag: 'messages', attrs: { type: 'invite', key: codeByJid.get(jid), count: String(count) } }] }] : []),
     { to: jid, content: [{ tag: 'message_updates', attrs: { count: String(count) } }] },
     { to: jid, content: [{ tag: 'messages', attrs: { count: String(count) } }] },
   ];
@@ -574,7 +630,16 @@ async function latestPostIds(socket, jid, count, log) {
       () => socket.newsletterFetchMessages(jid, count), // newer: (jid, count, since?, after?)
       () => socket.newsletterFetchMessages('jid', jid, count), // older: (type, key, count, after?)
       () => socket.newsletterFetchMessages(jid, count, 0),
+      () => socket.newsletterFetchMessages(jid, count, Math.floor(Date.now() / 1000) - 60 * 86400), // with a "since" date (60 days)
+      () => socket.newsletterFetchMessages(jid, count, 0, 0),
     );
+    const code = codeByJid.get(jid);
+    if (code) {
+      calls.push(
+        () => socket.newsletterFetchMessages('invite', code, count), // older Baileys: by invite code (no follow needed)
+        () => socket.newsletterFetchMessages('invite', code, count, 0),
+      );
+    }
   }
   if (typeof socket.newsletterFetchUpdates === 'function') {
     calls.push(() => socket.newsletterFetchUpdates(jid, count));
@@ -608,6 +673,7 @@ async function latestPostIds(socket, jid, count, log) {
  */
 export async function reactLatest(socket, c, log = () => {}) {
   const ids = await latestPostIds(socket, c.jid, BACKFILL_POSTS, log);
+  if (c.postHint && !ids.includes(c.postHint)) ids.unshift(c.postHint);
   const offset = Math.floor(Math.random() * c.emojis.length);
   let sent = 0;
   for (const [i, id] of ids.entries()) {
