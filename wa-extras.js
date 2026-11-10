@@ -8,9 +8,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { box } from './wa-menu.js';
 import { createMore, MORE_ALIASES, MORE_NAMES, isPublicHttps, youtubeId } from './wa-more.js';
-import { createNewCmds, ANIME_NAMES, GAME_NAMES, DL_NAMES, DL_ALIASES, GROUP_NAMES, SUDO_NAMES, TOOL_NAMES, NEW_ALIASES } from './wa-newcmds.js';
+import { createNewCmds, ANIME_NAMES, GAME_NAMES, DL_NAMES, DL_ALIASES, GROUP_NAMES, SUDO_NAMES, TOOL_NAMES, NEW_ALIASES, GAME_ALIASES } from './wa-newcmds.js';
 import { ffmpegBin, videoToWebp, addStickerMeta } from './media.js';
-import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost, lastBoostError } from './channelBoost.js';
+import { channel, inviteCode, resolveChannel, startBoost, stopBoost, campaignOf, giveBoost, lastBoostError, reactionModeOf } from './channelBoost.js';
 import { createSocial } from './dl-social.js';
 import { createContent } from './wa-content.js';
 export { isPublicHttps };
@@ -89,6 +89,7 @@ const CMD_ALIASES = {
   mf: 'mediafire',
   ...DL_ALIASES,
   ...NEW_ALIASES,
+  ...GAME_ALIASES,
   gpt: 'chatgpt', ai: 'chatgpt', bg: 'bing', ytsearch: 'yts', ytv: 'video', yta: 'song',
   fancytext: 'fancy',
   ...MORE_ALIASES,
@@ -608,17 +609,18 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return lines;
   }
 
-  async function applyBoostLink(link, reply) {
+  async function applyBoostLink(link, reply, postHint = null) {
     if (!settings.channelreact) {
       settings.channelreact = true;
       await saveSettings(authDir, settings);
     }
     awaitingLinkUntil = 0;
     await reply(box('🔎 CHANNEL REACT', ['Checking the channel…']));
-    const r = await startBoost(sock, link, myId());
+    const r = await startBoost(sock, link, myId(), postHint);
     if (!r.ok) {
       const why = { invalid_link: 'Invalid channel link.', not_found: 'Channel not found.', full: 'Too many channels are running right now. Try again later.' }[r.reason];
-      return reply(box('❌ CHANNEL REACT', [why, 'Example : https://whatsapp.com/channel/XXXX']));
+      const detail = r.reason === 'not_found' && lastBoostError() ? [`Reason : ${lastBoostError()}`] : [];
+      return reply(box('❌ CHANNEL REACT', [why, ...detail, 'Example : https://whatsapp.com/channel/XXXX']));
     }
     try { onSettingChange('channelreact', true); } catch { /* never block a setting */ }
     await reply(box('📣 CHANNEL REACT ✅', [
@@ -639,6 +641,7 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     else if (res.followersSkipped) lines.push('Free followers : already given today');
     else if (!res.pool) lines.push('Followers : *0* (no other connected account right now)');
     lines.push(`Reactions : *${res.reacts}*`);
+    if (reactionModeOf(r.campaign.jid) === 'BASIC') lines.push('ℹ️ This channel accepts only the 6 basic reactions (👍 ❤️ 😂 😮 😢 🙏), so only those are used.', 'To allow all emojis: Channel settings → Reactions → All emojis.');
     if (!res.reacts) {
       lines.push('⚠️ No reaction could be sent. Check that the link is a channel you can see, then try again in a minute.');
       if (lastBoostError()) lines.push(`Reason : ${lastBoostError()}`);
@@ -649,7 +652,11 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
 
   async function channelBoostCmd(args, { reply }) {
     const link = args.find((a) => CHANNEL_LINK.test(a));
-    if (link) return applyBoostLink(link.match(CHANNEL_LINK)[0], reply);
+    if (link) {
+      // a link of ONE post (…/channel/CODE/123) carries the post id: it is used directly
+      const hint = String(args.join(' ')).match(/whatsapp\.com\/channel\/[\w-]+\/(\d{1,12})/i)?.[1] || null;
+      return applyBoostLink(link.match(CHANNEL_LINK)[0], reply, hint);
+    }
     const v = String(args[0] || '').toLowerCase();
     if (['off', 'false', '0'].includes(v)) {
       settings.channelreact = false;
@@ -675,9 +682,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
   // Plain message (no prefix) right after .channelreact: a channel link sent alone is taken as the answer.
   async function boostLink(text, reply) {
     if (Date.now() > awaitingLinkUntil) return false;
-    const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)\/?$/i);
+    const hit = String(text || '').trim().match(/^(https?:\/\/(?:www\.)?whatsapp\.com\/channel\/[\w-]+)(?:\/(\d{1,12}))?\/?$/i);
     if (!hit) return false;
-    await applyBoostLink(hit[1], reply);
+    await applyBoostLink(hit[1], reply, hit[2] || null);
     return true;
   }
 
@@ -935,5 +942,5 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return true;
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo };
+  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo, gameText: newCmds.gameText };
 }
