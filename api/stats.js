@@ -1,7 +1,7 @@
 // GET /api/stats  ->  { ok, connected }   (cached 10 s)
-const { backend } = require('./_lib');
+import { backend } from './_lib.js';
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   res.setHeader('cache-control', 's-maxage=10, stale-while-revalidate=20');
   try {
     const { data } = await backend('/v1/stats', { method: 'GET' });
@@ -10,4 +10,4 @@ module.exports = async (req, res) => {
   } catch (e) {
     return res.status(200).json({ ok: false });
   }
-};
+}
