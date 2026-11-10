@@ -1,7 +1,0 @@
-# The Vercel site only needs index.html + api/ + vercel.json + package.json.
-# The bot files below belong to Railway: if Vercel sees index.js / server.js it runs them as the site and crashes (500).
-/*.js
-/Dockerfile
-/menu.jpg
-/game
-/games
