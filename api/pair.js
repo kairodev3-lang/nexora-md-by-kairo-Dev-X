@@ -1,7 +1,7 @@
 // POST /api/pair  { phone }  ->  { ok, status, code, expires_in }
-const { PHONE_RE, webId, backend, limited } = require('./_lib');
+import { PHONE_RE, webId, backend, limited } from './_lib.js';
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   res.setHeader('cache-control', 'no-store');
   const fail = (code, status, message, extra) => res.status(code).json({ ok: false, error: { code: status, message, ...extra } });
 
@@ -26,4 +26,4 @@ module.exports = async (req, res) => {
   } catch (e) {
     return fail(502, 'UNREACHABLE', 'Service unavailable. Try again in a moment.');
   }
-};
+}
