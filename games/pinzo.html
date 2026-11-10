@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Piano 7 Tuts</title>
+
+<style>
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  min-height: 600px;
+  overflow: hidden;
+}
+
+body {
+  position: relative;
+  width: 100%;
+  max-width: 700px;
+  min-height: 600px;
+  margin: 0 auto;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-family: Arial, sans-serif;
+  background:
+    radial-gradient(circle at top, #29245f, #0b0a1b 65%);
+  color: white;
+  overflow: hidden;
+}
+
+.piano-box {
+  width: min(95vw, 700px);
+  padding: 25px 18px 30px;
+  border-radius: 28px;
+  background: rgba(255,255,255,.08);
+  border: 1px solid rgba(255,255,255,.15);
+  box-shadow: 0 20px 60px rgba(0,0,0,.45);
+  backdrop-filter: blur(15px);
+  -webkit-backdrop-filter: blur(15px);
+  flex: 0 1 auto;
+  overflow: hidden;
+}
+
+h1 {
+  text-align: center;
+  margin: 0 0 8px;
+  font-size: 30px;
+}
+
+.subtitle {
+  text-align: center;
+  opacity: .7;
+  margin-bottom: 25px;
+}
+
+.piano {
+  display: flex;
+  width: 100%;
+  height: 330px;
+  gap: 5px;
+  touch-action: none;
+}
+
+.key {
+  position: relative;
+  flex: 1;
+  border: none;
+  border-radius: 0 0 14px 14px;
+  background: linear-gradient(
+    to bottom,
+    #ffffff,
+    #e9e9f2
+  );
+
+  box-shadow:
+    inset 0 -8px 0 rgba(0,0,0,.08),
+    0 8px 15px rgba(0,0,0,.25);
+
+  cursor: pointer;
+  transition:
+    transform .08s,
+    box-shadow .08s;
+
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+
+.key::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+
+  background: linear-gradient(
+    120deg,
+    transparent 25%,
+    rgba(255,255,255,.8),
+    transparent 70%
+  );
+
+  transform: translateX(-120%);
+  transition: .25s;
+}
+
+.key.active {
+  transform: translateY(8px);
+
+  box-shadow:
+    inset 0 -3px 0 rgba(0,0,0,.12),
+    0 2px 8px rgba(255,255,255,.35);
+}
+
+.key.active::before {
+  transform: translateX(120%);
+}
+
+.note {
+  position: absolute;
+  bottom: 45px;
+  left: 0;
+  right: 0;
+
+  text-align: center;
+  color: #292943;
+
+  font-size: 25px;
+  font-weight: bold;
+
+  pointer-events: none;
+}
+
+.key-number {
+  position: absolute;
+  bottom: 15px;
+  left: 0;
+  right: 0;
+
+  text-align: center;
+  color: #777;
+  font-size: 13px;
+
+  pointer-events: none;
+}
+
+/* =========================
+   EFEK BINTANG
+========================= */
+
+.spark {
+  position: absolute;
+
+  width: 6px;
+  height: 6px;
+
+  background: white;
+  border-radius: 50%;
+
+  pointer-events: none;
+
+  animation:
+    sparkle .7s ease-out forwards;
+
+  box-shadow:
+    0 0 8px #fff,
+    0 0 15px #b9a7ff;
+}
+
+@keyframes sparkle {
+
+  0% {
+    transform:
+      translate(0,0)
+      scale(.3);
+
+    opacity: 1;
+  }
+
+  100% {
+    transform:
+      translate(
+        calc((var(--x) - 50px) * 1px),
+        calc((var(--y) - 50px) * 1px)
+      )
+      scale(0);
+
+    opacity: 0;
+  }
+}
+
+/* Bintang silang */
+
+.spark::before,
+.spark::after {
+  content: "";
+
+  position: absolute;
+
+  left: 50%;
+  top: 50%;
+
+  transform:
+    translate(-50%,-50%);
+
+  background: white;
+
+  box-shadow:
+    0 0 8px #fff;
+}
+
+.spark::before {
+  width: 2px;
+  height: 14px;
+}
+
+.spark::after {
+  width: 14px;
+  height: 2px;
+}
+
+.info {
+  margin-top: 22px;
+
+  text-align: center;
+
+  opacity: .7;
+
+  font-size: 14px;
+}
+
+/* =========================
+   MOBILE
+========================= */
+
+/* =========================
+   VIEWPORT / WHATSAPP WEBVIEW
+   Sama seperti PIXZO: area HTML mengikuti viewport
+   dan hanya menyesuaikan jika tinggi layar terlalu pendek.
+========================= */
+@media (max-height: 560px) {
+  body {
+    min-height: 100%;
+    align-items: flex-start;
+    overflow-y: auto;
+  }
+
+  .piano-box {
+    width: min(95vw, 700px);
+    margin: 6px auto;
+    padding: 12px 10px 14px;
+  }
+
+  h1 {
+    font-size: clamp(20px, 6vw, 26px);
+    line-height: 1.08;
+    margin-bottom: 5px;
+  }
+
+  .subtitle {
+    font-size: clamp(12px, 3.2vw, 14px);
+    margin-bottom: 10px;
+  }
+
+  .piano {
+    height: min(300px, 52vh);
+    min-height: 190px;
+  }
+
+  .note {
+    bottom: 34px;
+    font-size: clamp(17px, 5vw, 20px);
+  }
+
+  .key-number {
+    bottom: 10px;
+    font-size: 10px;
+  }
+
+  .info {
+    margin-top: 8px;
+    font-size: 11px;
+  }
+}
+
+@media (max-height: 420px) {
+  .piano-box {
+    margin: 4px auto;
+    padding: 8px 7px 10px;
+    border-radius: 18px;
+  }
+
+  h1 {
+    font-size: clamp(18px, 5.5vw, 22px);
+    margin-bottom: 3px;
+  }
+
+  .subtitle {
+    font-size: clamp(10px, 2.7vw, 12px);
+    margin-bottom: 6px;
+  }
+
+  .piano {
+    height: min(300px, 48vh);
+    min-height: 165px;
+  }
+
+  .note {
+    bottom: 27px;
+    font-size: clamp(15px, 4.5vw, 18px);
+  }
+
+  .key-number {
+    bottom: 8px;
+    font-size: 9px;
+  }
+
+  .info {
+    margin-top: 5px;
+    font-size: 9px;
+  }
+}
+
+@media (max-height: 360px) {
+  .piano-box {
+    padding: 5px 5px 7px;
+    border-radius: 16px;
+  }
+
+  h1 {
+    font-size: 17px;
+  }
+
+  .subtitle {
+    font-size: 9px;
+    margin-bottom: 4px;
+  }
+
+  .piano {
+    height: min(300px, 44vh);
+    min-height: 145px;
+  }
+
+  .note {
+    bottom: 23px;
+    font-size: 14px;
+  }
+
+  .key-number {
+    bottom: 6px;
+    font-size: 8px;
+  }
+
+  .info {
+    margin-top: 3px;
+    font-size: 8px;
+  }
+}
+
+@media (max-width: 500px) {
+
+  .piano-box {
+    width: 96vw;
+    padding:
+      20px 10px 25px;
+
+    border-radius: 22px;
+  }
+
+  h1 {
+    font-size: 26px;
+  }
+
+  .subtitle {
+    font-size: 14px;
+    margin-bottom: 18px;
+  }
+
+  .piano {
+    height: 300px;
+    gap: 3px;
+  }
+
+  .key {
+    border-radius:
+      0 0 10px 10px;
+  }
+
+  .note {
+    bottom: 42px;
+    font-size: 20px;
+  }
+
+  .key-number {
+    bottom: 13px;
+    font-size: 11px;
+  }
+
+  .info {
+    font-size: 12px;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<div class="piano-box">
+
+  <h1>HALO BELAJAR PIANO YOK DI VEMZO</h1>
+
+  <div class="subtitle">
+    Do • Re • Mi • Fa • Sol • La • Si
+  </div>
+
+  <div class="piano">
+
+    <button
+      class="key"
+      data-note="C4"
+      data-key="a">
+
+      <span class="note">Do</span>
+      <span class="key-number">A</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="D4"
+      data-key="s">
+
+      <span class="note">Re</span>
+      <span class="key-number">S</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="E4"
+      data-key="d">
+
+      <span class="note">Mi</span>
+      <span class="key-number">D</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="F4"
+      data-key="f">
+
+      <span class="note">Fa</span>
+      <span class="key-number">F</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="G4"
+      data-key="g">
+
+      <span class="note">Sol</span>
+      <span class="key-number">G</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="A4"
+      data-key="h">
+
+      <span class="note">La</span>
+      <span class="key-number">H</span>
+
+    </button>
+
+    <button
+      class="key"
+      data-note="B4"
+      data-key="j">
+
+      <span class="note">Si</span>
+      <span class="key-number">J</span>
+
+    </button>
+
+  </div>
+
+  <div class="info">
+    Tekan tuts atau gunakan keyboard A S D F G H J
+  </div>
+
+</div>
+
+<script>
+
+/* =========================
+   AUDIO ENGINE
+========================= */
+
+const AudioContext =
+  window.AudioContext ||
+  window.webkitAudioContext;
+
+const audio = new AudioContext();
+
+
+/* Frekuensi piano */
+
+const frequencies = {
+
+  C4: 261.63,
+
+  D4: 293.66,
+
+  E4: 329.63,
+
+  F4: 349.23,
+
+  G4: 392.00,
+
+  A4: 440.00,
+
+  B4: 493.88
+
+};
+
+
+/* =========================
+   PLAY PIANO NOTE
+========================= */
+
+function playNote(note) {
+
+  if (audio.state === "suspended") {
+    audio.resume();
+  }
+
+  const now = audio.currentTime;
+
+  const freq =
+    frequencies[note];
+
+
+  /* Master */
+
+  const master =
+    audio.createGain();
+
+  const filter =
+    audio.createBiquadFilter();
+
+
+  filter.type =
+    "lowpass";
+
+  filter.frequency.setValueAtTime(
+    4200,
+    now
+  );
+
+  filter.Q.value =
+    0.7;
+
+
+  master.gain.setValueAtTime(
+    0,
+    now
+  );
+
+  master.gain.linearRampToValueAtTime(
+    0.8,
+    now + 0.008
+  );
+
+  master.gain.exponentialRampToValueAtTime(
+    0.001,
+    now + 2.2
+  );
+
+
+  filter.connect(master);
+
+  master.connect(
+    audio.destination
+  );
+
+
+  /* =====================
+     FUNDAMENTAL
+  ===================== */
+
+  const osc1 =
+    audio.createOscillator();
+
+  const gain1 =
+    audio.createGain();
+
+
+  osc1.type =
+    "triangle";
+
+  osc1.frequency.setValueAtTime(
+    freq,
+    now
+  );
+
+
+  gain1.gain.setValueAtTime(
+    0.8,
+    now
+  );
+
+  gain1.gain.exponentialRampToValueAtTime(
+    0.001,
+    now + 2.0
+  );
+
+
+  osc1.connect(gain1);
+
+  gain1.connect(filter);
+
+
+  /* =====================
+     HARMONIC 2
+  ===================== */
+
+  const osc2 =
+    audio.createOscillator();
+
+  const gain2 =
+    audio.createGain();
+
+
+  osc2.type =
+    "sine";
+
+  osc2.frequency.setValueAtTime(
+    freq * 2,
+    now
+  );
+
+
+  gain2.gain.setValueAtTime(
+    0.20,
+    now
+  );
+
+  gain2.gain.exponentialRampToValueAtTime(
+    0.001,
+    now + 1.4
+  );
+
+
+  osc2.connect(gain2);
+
+  gain2.connect(filter);
+
+
+  /* =====================
+     HARMONIC 3
+  ===================== */
+
+  const osc3 =
+    audio.createOscillator();
+
+  const gain3 =
+    audio.createGain();
+
+
+  osc3.type =
+    "sine";
+
+  osc3.frequency.setValueAtTime(
+    freq * 3,
+    now
+  );
+
+
+  gain3.gain.setValueAtTime(
+    0.08,
+    now
+  );
+
+  gain3.gain.exponentialRampToValueAtTime(
+    0.001,
+    now + 0.9
+  );
+
+
+  osc3.connect(gain3);
+
+  gain3.connect(filter);
+
+
+  /* =====================
+     PIANO ATTACK
+  ===================== */
+
+  const clickOsc =
+    audio.createOscillator();
+
+  const clickGain =
+    audio.createGain();
+
+
+  clickOsc.type =
+    "square";
+
+  clickOsc.frequency.setValueAtTime(
+    freq * 4,
+    now
+  );
+
+
+  clickGain.gain.setValueAtTime(
+    0.045,
+    now
+  );
+
+  clickGain.gain.exponentialRampToValueAtTime(
+    0.001,
+    now + 0.035
+  );
+
+
+  clickOsc.connect(
+    clickGain
+  );
+
+  clickGain.connect(
+    filter
+  );
+
+
+  /* =====================
+     START
+  ===================== */
+
+  osc1.start(now);
+
+  osc2.start(now);
+
+  osc3.start(now);
+
+  clickOsc.start(now);
+
+
+  /* =====================
+     STOP
+  ===================== */
+
+  osc1.stop(
+    now + 2.25
+  );
+
+  osc2.stop(
+    now + 1.45
+  );
+
+  osc3.stop(
+    now + 0.95
+  );
+
+  clickOsc.stop(
+    now + 0.04
+  );
+}
+
+
+/* =========================
+   SPARKLE EFFECT
+========================= */
+
+function sparkle(key) {
+
+  for (
+    let i = 0;
+    i < 7;
+    i++
+  ) {
+
+    const spark =
+      document.createElement(
+        "span"
+      );
+
+    spark.className =
+      "spark";
+
+
+    spark.style.left =
+      (
+        30 +
+        Math.random() * 40
+      ) + "%";
+
+
+    spark.style.top =
+      (
+        25 +
+        Math.random() * 35
+      ) + "%";
+
+
+    spark.style.setProperty(
+      "--x",
+      Math.random() * 140 - 70
+    );
+
+
+    spark.style.setProperty(
+      "--y",
+      Math.random() * 140 - 70
+    );
+
+
+    key.appendChild(
+      spark
+    );
+
+
+    setTimeout(() => {
+
+      spark.remove();
+
+    }, 700);
+
+  }
+}
+
+
+/* =========================
+   PRESS KEY
+========================= */
+
+function press(key) {
+
+  const note =
+    key.dataset.note;
+
+
+  key.classList.add(
+    "active"
+  );
+
+
+  playNote(note);
+
+  sparkle(key);
+
+
+  setTimeout(() => {
+
+    key.classList.remove(
+      "active"
+    );
+
+  }, 150);
+}
+
+
+/* =========================
+   TOUCH / CLICK
+========================= */
+
+document
+  .querySelectorAll(".key")
+  .forEach(key => {
+
+    key.addEventListener(
+      "pointerdown",
+      e => {
+
+        e.preventDefault();
+
+        press(key);
+
+      }
+    );
+
+  });
+
+
+/* =========================
+   KEYBOARD
+========================= */
+
+const keyMap = {
+
+  a: "C4",
+
+  s: "D4",
+
+  d: "E4",
+
+  f: "F4",
+
+  g: "G4",
+
+  h: "A4",
+
+  j: "B4"
+
+};
+
+
+document.addEventListener(
+  "keydown",
+  e => {
+
+    if (e.repeat) return;
+
+
+    const letter =
+      e.key.toLowerCase();
+
+
+    if (!keyMap[letter]) {
+      return;
+    }
+
+
+    const key =
+      document.querySelector(
+        '.key[data-key="' + letter + '"]'
+      );
+
+
+    if (key) {
+
+      press(key);
+
+    }
+
+  }
+);
+
+</script>
+
+</body>
+</html>
