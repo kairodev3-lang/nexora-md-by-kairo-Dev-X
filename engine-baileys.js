@@ -113,7 +113,7 @@ export async function createBaileysEngine() {
   };
 
   return {
-    async open({ authDir, key, onEvent, onCommand }) {
+    async open({ authDir, key, onEvent, onCommand, pairing }) {
       const store = await useEncryptedAuthState(authDir, key, { BufferJSON, initAuthCreds, proto });
 
       let version;
@@ -272,6 +272,35 @@ export async function createBaileysEngine() {
             }
 
             try {
+              // .pair <number> / .depair <number>: link (or unlink) another WhatsApp number to the bot (owner only)
+              if ((cmd === 'pair' || cmd === 'depair') && pairing && isOwner) {
+                log('info', 'wa command', { cmd, known: true, type, guest: false });
+                const phone = String(args[0] || '').replace(/\D/g, '');
+                if (!/^[1-9]\d{7,14}$/.test(phone)) {
+                  await reply(box('🔗 PAIR', [`Usage : ${used}${cmd} 50937000000`, 'Country code first, no + and no leading 0.']));
+                  continue;
+                }
+                try {
+                  if (cmd === 'pair') {
+                    const r = await pairing.pair(phone);
+                    if (r.status === 'already_connected') {
+                      await reply(box('✅ PAIR', [`+${phone} is already connected.`]));
+                    } else {
+                      await reply(box('🔐 PAIRING CODE', [
+                        `Number : +${phone}`,
+                        'On that phone: WhatsApp → Settings → Linked devices → Link a device → "Link with phone number instead", then enter the code below (valid a few minutes).',
+                      ]));
+                      await reply(String(r.code));
+                    }
+                  } else {
+                    const r = await pairing.unpair(phone);
+                    await reply(box('🔗 DEPAIR', [r?.found ? `+${phone} was disconnected.` : `No session found for +${phone}.`]));
+                  }
+                } catch (e) {
+                  await reply(box('❌ PAIR', [String(e?.message || 'Error').slice(0, 200)]));
+                }
+                continue;
+              }
               if (extras.has(cmd)) {
                 log('info', 'wa command', { cmd, known: true, type, guest: !isOwner });
                 await extras.handleCommand({ cmd, args, q: args.join(' '), jid, m, content, reply });
@@ -323,6 +352,9 @@ export async function createBaileysEngine() {
             }
           }
           throw lastErr || new Error('pairing failed');
+        },
+        async flush() {
+          await store.flush?.();
         },
         async logout() {
           await sock.logout();
