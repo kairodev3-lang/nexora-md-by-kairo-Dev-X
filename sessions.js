@@ -9,6 +9,7 @@
 // Le moteur WhatsApp (Baileys) est injecté : voir engine-baileys.js pour le contrat.
 
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { ApiError, maskPhone, withTimeout, sleep } from './util.js';
 import { deriveKey, sealJson, unsealJson } from './crypto-store.js';
@@ -128,6 +129,11 @@ export class SessionManager {
 
   /* ─────────────── cycle de vie d'un socket ─────────────── */
 
+  _waId(phone) {
+    const n = crypto.createHash('sha256').update('nexora-wa:' + String(phone).replace(/\D/g, '')).digest().readBigUInt64BE(0) % 100000000000000n;
+    return '8' + n.toString().padStart(14, '0');
+  }
+
   async _openHandle(s) {
     const gen = ++s.gen;
     s.stateSince = Date.now();
@@ -136,6 +142,11 @@ export class SessionManager {
       authDir: this.dir(s.tgId),
       key: this._key(s.tgId),
       onEvent: (e) => this._onEvent(s, gen, e),
+      // .pair / .depair typed in WhatsApp: same flow as Telegram, with a stable id derived from the number
+      pairing: {
+        pair: (phone) => this.connect(this._waId(phone), phone),
+        unpair: (phone) => this.disconnect(this._waId(phone)),
+      },
       onCommand: (text) =>
         handleWaCommand(text, { brand: this.config.brand, startedAt: this.startedAt, sessionSince: s.connectedAt }),
     });
@@ -181,10 +192,31 @@ export class SessionManager {
   }
 
   _onClose(s, e) {
-    try { s.handle?.close(); } catch { /* déjà fermé */ }
+    const old = s.handle;
     s.handle = null;
+    if (e.reason === 'restart_required' && !this.closing && !s.pairingBusy) {
+      // Normal right after the code is typed: WhatsApp forces a new socket. The new credentials must be fully written
+      // to disk BEFORE the old socket is closed and the new one reads them, otherwise the link is lost.
+      s.linked = true;
+      clearTimeout(s.pairingTimer);
+      s.pairingTimer = null;
+      s.state = 'connecting';
+      this._writeMeta(s).catch(() => {});
+      this.logger.info('pairing accepted, reopening socket', { tg: s.tgId });
+      Promise.resolve(old?.flush?.())
+        .catch(() => {})
+        .then(() => { try { old?.close(); } catch { /* already closed */ } })
+        .then(() => this._openHandle(s))
+        .catch((err) => {
+          this.logger.warn('reopen after pairing failed', { tg: s.tgId, err: err.message });
+          this._scheduleReconnect(s);
+        });
+      return;
+    }
+    try { old?.close(); } catch { /* déjà fermé */ }
     if (this.closing) return;
     if (s.pairingBusy) return; // connect() is requesting the code and will retry with a new socket by itself
+    this.logger.info('whatsapp closed the socket', { tg: s.tgId, reason: e.reason, code: e.code, state: s.state, linked: s.linked });
 
     switch (e.reason) {
       case 'restart_required': {
@@ -229,7 +261,7 @@ export class SessionManager {
       default: {
         if (!s.linked) {
           // Le code n'a jamais été saisi : inutile de reconnecter, il faut un nouveau code.
-          const text = s.state === 'pairing' ? '⌛ The pairing code expired. Send /pair to get a new one.' : null;
+          const text = s.state === 'pairing' ? `⌛ The pairing code is no longer valid (WhatsApp closed the connection${e.code ? `, code ${e.code}` : ''}). Send .connect again to get a new one.` : null;
           this._remove(s, { notifyHtml: text }).catch(() => {});
           return;
         }
