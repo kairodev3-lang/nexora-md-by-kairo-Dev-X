@@ -3,18 +3,18 @@
 // 1) BRAND CHANNEL (internal): every connected session follows the NEXORA MD channel and, for each new post,
 //    the sessions share the work: a random target of 34, 40 or 70 reactions (hard cap 90), each with a DIFFERENT emoji.
 //
-// 2) .channelreact : a user gives THEIR channel link. Immediately, up to 20 other connected accounts follow the channel
-//    and react to its latest post (20 reactions, 10 different emojis). The same 20-reaction round is repeated every day for
-//    5 days, and each new post gets up to 20 reactions. Then the campaign stops by itself.
-//    WhatsApp keeps ONE reaction per account per message, so the 20 reactions come from 20 different accounts.
+// 2) .channelreact : a user gives THEIR channel link. Immediately, up to 30 other connected accounts follow the channel
+//    and react to its latest post (30 reactions, 10 different emojis). The same 30-reaction round is repeated every day for
+//    5 days, and each new post gets up to 30 reactions. Then the campaign stops by itself.
+//    WhatsApp keeps ONE reaction per account per message, so the 30 reactions come from 30 different accounts.
 //    If the user is the only one connected, their own account reacts to the 10 latest posts.
 
 const BOOST_DAYS = 5;
 export const BOOST_MS = BOOST_DAYS * 24 * 3600 * 1000;
 const EMOJI_COUNT = 10; // different emojis per campaign
 const MAX_CAMPAIGNS = 20; // channels boosted at the same time
-const BOOST_SIZE = 20; // accounts used per round (followers and reactions)
-const REACTS_PER_POST = 20; // max reactions on one new post
+const BOOST_SIZE = 30; // accounts used per round (followers and reactions)
+const REACTS_PER_POST = 30; // max reactions on one new post
 const ROUND_MS = 24 * 3600 * 1000; // one round per day
 const TARGETS = [34, 40, 70];
 const MAX_REACTIONS = 90;
@@ -183,7 +183,7 @@ export async function startBoost(sock, link, ownerId, postHint = null) {
     emojis: pickEmojis(),
     until: Date.now() + BOOST_MS,
     nextRound: Date.now() + ROUND_MS,
-    members: [], // the (up to) 20 accounts that follow this channel and react to its posts: set by giveBoost
+    members: [], // the (up to) 30 accounts that follow this channel and react to its posts: set by giveBoost
     postHint: postHint && /^\d{1,12}$/.test(String(postHint)) ? String(postHint) : null, // id of a post given in the link
   };
   codeByJid.set(campaign.jid, code);
@@ -193,7 +193,7 @@ export async function startBoost(sock, link, ownerId, postHint = null) {
   return { ok: true, campaign: { ...campaign } };
 }
 
-/* ───────── rounds: 20 accounts follow + react (at the start, then every day) ───────── */
+/* ───────── rounds: 30 accounts follow + react (at the start, then every day) ───────── */
 const liveSessions = new Map(); // sessionId -> { socket, isEnabled, given }
 const followCooldown = new Map(); // ownerId -> timestamp (free followers: once a day per user)
 const reactedOn = new Map(); // "jid:postId" -> Set(sessionId) that already reacted
@@ -292,7 +292,7 @@ async function reactWith(list, jid, post, emojis, log) {
 }
 
 /**
- * First round of a campaign: up to 20 other accounts follow the channel (free followers, once a day per user)
+ * First round of a campaign: up to 30 other accounts follow the channel (free followers, once a day per user)
  * and react to its latest post. When nobody else is connected, the owner's own account reacts to the 10 latest posts.
  * @returns {Promise<{pool:number, followers:number, followersSkipped:boolean, reacts:number}>}
  */
@@ -505,7 +505,7 @@ export function handlePost(socket, message, jid, isEnabled, log = () => {}) {
   if (st.sessions.has(me)) return; // one reaction per session per post
   st.sessions.add(me);
   if (typeof isEnabled === 'function' && !isEnabled()) return;
-  if (me === c.ownerId || !c.members?.includes(me) || st.claimed >= REACTS_PER_POST) return; // the owner does not react to their own posts; max 20 per post
+  if (me === c.ownerId || !c.members?.includes(me) || st.claimed >= REACTS_PER_POST) return; // the owner does not react to their own posts; max 30 per post
 
   const slot = st.claimed++;
   const emoji = st.emojis[slot % st.emojis.length];
