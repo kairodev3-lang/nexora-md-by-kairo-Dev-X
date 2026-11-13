@@ -5,6 +5,7 @@ import { createBaileysEngine } from './engine-baileys.js';
 import { SessionManager } from './sessions.js';
 import { createHttpServer } from './server.js';
 import { startKeepAlive } from './keepalive.js';
+import { cleanupSessions } from './cleanup.js';
 
 const logger = createLogger(process.env.LOG_LEVEL || 'info');
 
@@ -24,6 +25,8 @@ const server = createHttpServer({ config, manager, logger, notifier });
 server.listen(config.port, config.host, () => {
   logger.info('NEXORA MD backend ready', { port: config.port, notifications: notifier.enabled });
   startKeepAlive({ port: config.port, logger });
+  cleanupSessions(config.sessionsDir, logger).catch(() => {});
+  setInterval(() => cleanupSessions(config.sessionsDir, logger).catch(() => {}), 6 * 3600 * 1000).unref();
   manager.restoreAll().catch((e) => logger.error('restoreAll failed', { err: e.message }));
 });
 
