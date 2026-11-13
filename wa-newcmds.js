@@ -1,3 +1,4 @@
+import { inflateRawSync } from 'node:zlib';
 // wa-newcmds.js — new commands (loaded by wa-extras.js)
 //
 //   ANIME     .mywaifu  — 8 waifu pictures as an album (waifu.im)
@@ -89,6 +90,42 @@ export function extractMedia(data) {
     if (!best || score > best.score) best = { ...f, score };
   }
   return best && best.score > -5 ? { url: best.url, title: cut(title, 90) } : null;
+}
+
+/** Minimal ZIP reader (stored/deflate) → [{file, data(base64), encoding:'base64'}] for the Vercel API. */
+export function readZip(buf, { maxFiles = 400, maxTotal = 12_000_000 } = {}) {
+  let e = -1;
+  for (let k = buf.length - 22; k >= Math.max(0, buf.length - 65_557); k--) if (buf.readUInt32LE(k) === 0x06054b50) { e = k; break; }
+  if (e < 0) throw new Error('zip: invalid file');
+  const count = buf.readUInt16LE(e + 10);
+  let off = buf.readUInt32LE(e + 16);
+  const out = [];
+  let total = 0;
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(off) !== 0x02014b50) throw new Error('zip: corrupted');
+    const method = buf.readUInt16LE(off + 10);
+    const csize = buf.readUInt32LE(off + 20);
+    const nlen = buf.readUInt16LE(off + 28), xlen = buf.readUInt16LE(off + 30), clen = buf.readUInt16LE(off + 32);
+    const lho = buf.readUInt32LE(off + 42);
+    const name = buf.slice(off + 46, off + 46 + nlen).toString('utf8').replace(/\\/g, '/');
+    off += 46 + nlen + xlen + clen;
+    if (name.endsWith('/') || name.startsWith('__MACOSX/') || /(^|\/)\.DS_Store$/.test(name)) continue;
+    if (name.split('/').some((x) => x === '..')) continue;
+    const lnl = buf.readUInt16LE(lho + 26), lxl = buf.readUInt16LE(lho + 28);
+    const raw = buf.slice(lho + 30 + lnl + lxl, lho + 30 + lnl + lxl + csize);
+    let data;
+    if (method === 0) data = raw;
+    else if (method === 8) data = inflateRawSync(raw, { maxOutputLength: maxTotal });
+    else throw new Error('zip: unsupported compression');
+    total += data.length;
+    if (total > maxTotal) throw new Error('zip: too big (max 12 MB)');
+    out.push({ file: name, data: data.toString('base64'), encoding: 'base64' });
+    if (out.length > maxFiles) throw new Error('zip: too many files');
+  }
+  // remove a single wrapping folder (my-site/index.html → index.html)
+  const tops = new Set(out.map((f) => f.file.split('/')[0]));
+  if (tops.size === 1 && out.every((f) => f.file.includes('/'))) for (const f of out) f.file = f.file.split('/').slice(1).join('/');
+  return out;
 }
 
 export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalThis.fetch, P, helpers = {}, isSelf = () => false, settings = {}, persist = async () => {} }) {
@@ -402,37 +439,69 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
 
   /* ═════════════ DEPLOY (HTML → Vercel) ═════════════ */
   // .deploy <site-name>  while replying to a message that contains HTML code, or to an .html file.
-  // Needs the env variable VERCEL_TOKEN (Vercel → Settings → Tokens). Real owner only (not sudo).
+  // Each connected user saves their own Vercel token with .deploy token <TOKEN>. Real owner of the session only (not sudo).
+  let deployLog = [];
   const deploy = async ({ args, jid, m, content, reply }) => {
     if (!m.key?.fromMe) return reply(box('❌ DEPLOY', ['Owner only.']));
-    const name = String(args[0] || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 52);
-    if (!name) return reply(box('🚀 DEPLOY', ['Reply to a message with HTML code (or an .html file) and send:', `*${P()}deploy mysite*`]));
-    const token = process.env.VERCEL_TOKEN;
-    if (!token) return reply(box('❌ DEPLOY', ['The Vercel token is not set.', 'Add the variable *VERCEL_TOKEN* on Railway (Vercel → Settings → Tokens).']));
+    // Each connected user deploys to THEIR OWN Vercel account with their own token (saved for this session only).
+    const sub = String(args[0] || '').toLowerCase();
+    if (sub === 'token') {
+      const t = String(args[1] || '').trim();
+      if (sub === 'token' && (args[1] || '').toLowerCase() === 'remove') { delete settings.vercelToken; await persist(); return reply(box('✅ DEPLOY', ['Vercel token removed.'])); }
+      if (t.length < 20) return reply(box('🔑 DEPLOY TOKEN', ['Get a token : vercel.com/account/tokens', `Then send : *${P()}deploy token YOUR_TOKEN*`, 'Remove it : *' + P() + 'deploy token remove*']));
+      settings.vercelToken = t;
+      await persist();
+      try { await sock.sendMessage(jid, { delete: m.key }); } catch { /* ignore */ }
+      return reply(box('✅ DEPLOY', ['Vercel token saved for your account.', 'Your message with the token was deleted.', `Now reply to HTML code with *${P()}deploy mysite*`]));
+    }
+    const base = String(args[0] || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    if (!base) return reply(box('🚀 DEPLOY', ['Reply to HTML code, an .html file or a .zip file and send:', `*${P()}deploy mysite*`]));
+    // Shared host token (Railway VERCEL_TOKEN) unless the user saved their own token.
+    const token = settings.vercelToken || process.env.VERCEL_TOKEN;
+    if (!token) return reply(box('❌ DEPLOY', ['Deploy is not configured.', 'Ask the bot owner to set VERCEL_TOKEN.']));
+    // On the shared account, each session gets its own suffix so two users never overwrite the same project.
+    const who = String(sock.user?.id || '').split('@')[0].split(':')[0].replace(/\D/g, '').slice(-4) || '0000';
+    const name = settings.vercelToken ? base : `${base}-${who}`.slice(0, 52);
+    if (!settings.vercelToken) {
+      const now = Date.now();
+      deployLog = deployLog.filter((t) => now - t < 3_600_000);
+      if (deployLog.length >= 6) return reply(box('⏳ DEPLOY', ['Limit reached : 6 deployments per hour.', 'Try again later.']));
+      deployLog.push(now);
+    }
     const ci = content?.extendedTextMessage?.contextInfo;
     const qm = ci?.quotedMessage ? (helpers.normalizeMessageContent?.(ci.quotedMessage) || ci.quotedMessage) : null;
-    if (!qm) return reply(box('❌ DEPLOY', ['HTML not found.', 'Reply to a message with HTML code, or to an .html file.']));
+    if (!qm) return reply(box('❌ DEPLOY', ['Nothing to deploy.', 'Reply to HTML code, an .html file or a .zip file.']));
     let html = qm.conversation || qm.extendedTextMessage?.text || qm.imageMessage?.caption || '';
+    let files = null;
     try {
       const doc = qm.documentMessage;
-      if (!html && doc && (/html/i.test(doc.mimetype || '') || /\.html?$/i.test(doc.fileName || ''))) {
+      const isZip = doc && (/zip/i.test(doc.mimetype || '') || /\.zip$/i.test(doc.fileName || ''));
+      const isHtml = doc && (/html/i.test(doc.mimetype || '') || /\.html?$/i.test(doc.fileName || ''));
+      if (!html && doc && (isZip || isHtml)) {
         const msgLike = { key: { remoteJid: jid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: qm };
         const buffer = await helpers.downloadMediaMessage(msgLike, 'buffer', {}, { logger: helpers.logger, reuploadRequest: sock.updateMediaMessage });
-        html = buffer.toString('utf8');
+        if (isZip) files = readZip(buffer);
+        else html = buffer.toString('utf8');
       }
     } catch (e) {
       log('warn', 'deploy download failed', { why: String(e?.message || '').slice(0, 60) });
+      if (/zip/i.test(String(e?.message))) return reply(box('❌ DEPLOY', [String(e.message).slice(0, 150)]));
     }
-    if (!html) return reply(box('❌ DEPLOY', ['Unsupported message.', 'Reply to HTML text or to an .html file.']));
-    if (!/<html|<!doctype html|<head|<body/i.test(html)) return reply(box('❌ DEPLOY', ['This is not valid HTML.']));
-    if (html.length > 4_000_000) return reply(box('❌ DEPLOY', ['The HTML is too big (max 4 MB).']));
+    if (files) {
+      if (!files.some((f) => f.file === 'index.html')) return reply(box('❌ DEPLOY', ['The zip must contain an *index.html* file.']));
+    } else {
+      if (!html) return reply(box('❌ DEPLOY', ['Unsupported message.', 'Reply to HTML text, an .html file or a .zip file.']));
+      if (!/<html|<!doctype html|<head|<body/i.test(html)) return reply(box('❌ DEPLOY', ['This is not valid HTML.']));
+      if (html.length > 4_000_000) return reply(box('❌ DEPLOY', ['The HTML is too big (max 4 MB).']));
+      files = [{ file: 'index.html', data: html }];
+    }
     react(jid, m, '🚀');
     try {
       const res = await fetchImpl('https://api.vercel.com/v13/deployments', {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, project: name, target: 'production', files: [{ file: 'index.html', data: html }], projectSettings: { framework: null } }),
-        signal: AbortSignal.timeout(60_000),
+        body: JSON.stringify({ name, project: name, target: 'production', files, projectSettings: { framework: null } }),
+        signal: AbortSignal.timeout(90_000),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error?.message || data?.message || `Vercel error ${res.status}`);
@@ -443,7 +512,7 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
         domain = list.find((x) => !x.name.endsWith('.vercel.app'))?.name || list.find((x) => x.name.endsWith('.vercel.app'))?.name || domain;
       } catch { /* keep the default domain */ }
       react(jid, m, '✅');
-      return reply(box('✅ DEPLOY SUCCESS', [`Name : *${name}*`, 'Platform : Vercel (static HTML)', 'Status : building (ready in a few seconds)', '', `https://${domain}`]));
+      return reply(box('✅ DEPLOY SUCCESS', [`Name : *${name}*`, 'Platform : Vercel (static site)', 'Status : building (ready in a few seconds)', '', `https://${domain}`]));
     } catch (e) {
       react(jid, m, '❌');
       return reply(box('❌ DEPLOY FAILED', [String(e?.message || 'Error').slice(0, 200)]));
