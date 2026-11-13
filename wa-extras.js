@@ -153,6 +153,7 @@ export async function loadSettings(dir) {
     if (Array.isArray(raw.sudo)) s.sudo = raw.sudo.map((x) => String(x).replace(/\D/g, '')).filter((x) => x.length >= 7 && x.length <= 15).slice(0, 30);
     if (REACT_SCOPES.includes(raw.autoreact)) s.autoreact = raw.autoreact;
     if (typeof raw.autoreactstyle === 'string' && REACT_STYLES[raw.autoreactstyle]) s.autoreactstyle = raw.autoreactstyle;
+    if (typeof raw.vercelToken === 'string' && raw.vercelToken.length >= 20 && raw.vercelToken.length <= 200) s.vercelToken = raw.vercelToken;
     if (typeof raw.prefix === 'string' && raw.prefix.length === 1 && PREFIX_CHARS.includes(raw.prefix)) s.prefix = raw.prefix;
   } catch {
     /* no file or unreadable file → default values */
