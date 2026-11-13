@@ -26,10 +26,10 @@ export const ANIME_NAMES = ['mywaifu'];
 export const ANIME_ALIASES = { waifu: 'mywaifu', waifuim: 'mywaifu', waifus: 'mywaifu' };
 
 /* ───────── GROUP / SUDO / TOOLS ───────── */
-export const GROUP_NAMES = ['delete', 'hidetag', 'promote', 'demote'];
-export const SUDO_NAMES = ['sudo', 'delsudo'];
+export const GROUP_NAMES = ['delete', 'hidetag', 'promote', 'demote', 'sondaj'];
+export const SUDO_NAMES = ['sudo', 'delsudo', 'deploy'];
 export const TOOL_NAMES = ['remini'];
-export const NEW_ALIASES = { ...ANIME_ALIASES, del: 'delete', ht: 'hidetag', rmsudo: 'delsudo', upscale: 'remini', hd: 'remini', url: 'tourl' };
+export const NEW_ALIASES = { ...ANIME_ALIASES, del: 'delete', ht: 'hidetag', rmsudo: 'delsudo', upscale: 'remini', vercel: 'deploy', poll: 'sondaj', vote: 'sondaj', hd: 'remini', url: 'tourl' };
 const RECENT_PER_CHAT = 60;
 const MAX_UPLOAD = 50 * 1024 * 1024;
 
@@ -400,6 +400,121 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
     return null;
   };
 
+  /* ═════════════ DEPLOY (HTML → Vercel) ═════════════ */
+  // .deploy <site-name>  while replying to a message that contains HTML code, or to an .html file.
+  // Needs the env variable VERCEL_TOKEN (Vercel → Settings → Tokens). Real owner only (not sudo).
+  const deploy = async ({ args, jid, m, content, reply }) => {
+    if (!m.key?.fromMe) return reply(box('❌ DEPLOY', ['Owner only.']));
+    const name = String(args[0] || '').toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 52);
+    if (!name) return reply(box('🚀 DEPLOY', ['Reply to a message with HTML code (or an .html file) and send:', `*${P()}deploy mysite*`]));
+    const token = process.env.VERCEL_TOKEN;
+    if (!token) return reply(box('❌ DEPLOY', ['The Vercel token is not set.', 'Add the variable *VERCEL_TOKEN* on Railway (Vercel → Settings → Tokens).']));
+    const ci = content?.extendedTextMessage?.contextInfo;
+    const qm = ci?.quotedMessage ? (helpers.normalizeMessageContent?.(ci.quotedMessage) || ci.quotedMessage) : null;
+    if (!qm) return reply(box('❌ DEPLOY', ['HTML not found.', 'Reply to a message with HTML code, or to an .html file.']));
+    let html = qm.conversation || qm.extendedTextMessage?.text || qm.imageMessage?.caption || '';
+    try {
+      const doc = qm.documentMessage;
+      if (!html && doc && (/html/i.test(doc.mimetype || '') || /\.html?$/i.test(doc.fileName || ''))) {
+        const msgLike = { key: { remoteJid: jid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: qm };
+        const buffer = await helpers.downloadMediaMessage(msgLike, 'buffer', {}, { logger: helpers.logger, reuploadRequest: sock.updateMediaMessage });
+        html = buffer.toString('utf8');
+      }
+    } catch (e) {
+      log('warn', 'deploy download failed', { why: String(e?.message || '').slice(0, 60) });
+    }
+    if (!html) return reply(box('❌ DEPLOY', ['Unsupported message.', 'Reply to HTML text or to an .html file.']));
+    if (!/<html|<!doctype html|<head|<body/i.test(html)) return reply(box('❌ DEPLOY', ['This is not valid HTML.']));
+    if (html.length > 4_000_000) return reply(box('❌ DEPLOY', ['The HTML is too big (max 4 MB).']));
+    react(jid, m, '🚀');
+    try {
+      const res = await fetchImpl('https://api.vercel.com/v13/deployments', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, project: name, target: 'production', files: [{ file: 'index.html', data: html }], projectSettings: { framework: null } }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error?.message || data?.message || `Vercel error ${res.status}`);
+      let domain = `${name}.vercel.app`;
+      try {
+        const d = await fetchImpl(`https://api.vercel.com/v9/projects/${encodeURIComponent(name)}/domains`, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(20_000) });
+        const list = (await d.json())?.domains || [];
+        domain = list.find((x) => !x.name.endsWith('.vercel.app'))?.name || list.find((x) => x.name.endsWith('.vercel.app'))?.name || domain;
+      } catch { /* keep the default domain */ }
+      react(jid, m, '✅');
+      return reply(box('✅ DEPLOY SUCCESS', [`Name : *${name}*`, 'Platform : Vercel (static HTML)', 'Status : building (ready in a few seconds)', '', `https://${domain}`]));
+    } catch (e) {
+      react(jid, m, '❌');
+      return reply(box('❌ DEPLOY FAILED', [String(e?.message || 'Error').slice(0, 200)]));
+    }
+  };
+
+  /* ═════════════ SONDAJ (real WhatsApp poll, votes counted from the people who vote) ═════════════ */
+  // .sondaj <question> | <option 1> | <option 2> | ...   → the bot posts a native poll; people vote in WhatsApp.
+  // .sondaj result  → who is ahead (latest poll of this chat)      .sondaj end → final result, stop counting
+  const polls = new Map(); // poll message id -> { jid, msg, name, options, votes: Map(voter -> option names[]), at }
+  const lastPoll = new Map(); // chat jid -> poll message id
+  const pollText = (p, final) => {
+    const counts = p.options.map((o) => [o, 0]);
+    for (const names of p.votes.values()) for (const n of names) { const c = counts.find((x) => x[0] === n); if (c) c[1]++; }
+    const total = [...p.votes.values()].filter((v) => v.length).length;
+    const top = Math.max(0, ...counts.map((c) => c[1]));
+    const lines = [`❓ *${p.name}*`, ''];
+    counts.forEach(([o, n], i) => {
+      const pct = total ? Math.round((n / total) * 100) : 0;
+      lines.push(`${i + 1}. ${o} — *${n}* (${pct}%) ${'█'.repeat(Math.round(pct / 10))}${'░'.repeat(10 - Math.round(pct / 10))}`);
+    });
+    lines.push('', `Voters : *${total}*`);
+    const leaders = counts.filter((c) => c[1] === top && top > 0).map((c) => c[0]);
+    lines.push(!leaders.length ? 'No vote yet.' : leaders.length === 1 ? `🏆 ${final ? 'Winner' : 'Leading'} : *${leaders[0]}* (${top})` : `🤝 Tie : ${leaders.map((l) => `*${l}*`).join(' / ')} (${top})`);
+    return lines;
+  };
+  const sondaj = async ({ args, q, jid, m, reply }) => {
+    const sub = String(args[0] || '').toLowerCase();
+    if (sub === 'result' || sub === 'results' || sub === 'end') {
+      const id = lastPoll.get(jid);
+      const p = id && polls.get(id);
+      if (!p) return reply(box('📊 SONDAJ', ['No poll in this chat.', `Create one : *${P()}sondaj Question? | Option 1 | Option 2*`]));
+      if (sub === 'end') { polls.delete(id); lastPoll.delete(jid); }
+      return reply(box(sub === 'end' ? '🏁 SONDAJ (FINAL)' : '📊 SONDAJ', pollText(p, sub === 'end')));
+    }
+    const parts = String(q || '').split('|').map((x) => x.trim()).filter(Boolean);
+    if (parts.length < 3 || parts.length > 13) {
+      return reply(box('📊 SONDAJ', [
+        `Create : *${P()}sondaj Question? | Option 1 | Option 2 | …*`,
+        '(2 to 12 options, separated by |)',
+        `Ahead now : *${P()}sondaj result*`,
+        `Final result : *${P()}sondaj end*`,
+      ]));
+    }
+    const [name, ...options] = parts;
+    const unique = [...new Set(options)];
+    if (unique.length < 2) return reply(box('❌ SONDAJ', ['Give at least 2 different options.']));
+    const sent = await sock.sendMessage(jid, { poll: { name: name.slice(0, 250), values: unique.map((o) => o.slice(0, 100)), selectableCount: 1 } }, { quoted: m });
+    if (polls.size >= 50) polls.delete(polls.keys().next().value);
+    polls.set(sent.key.id, { jid, msg: sent, name, options: unique, votes: new Map(), at: Date.now() });
+    lastPoll.set(jid, sent.key.id);
+    return null;
+  };
+
+  /** messages.update events: collect the votes of the polls created by this bot. */
+  const onUpdates = async (updates) => {
+    for (const { key, update } of updates || []) {
+      try {
+        if (!update?.pollUpdates?.length || !key?.id) continue;
+        const p = polls.get(key.id);
+        if (!p) continue;
+        const { getAggregateVotesInPollMessage } = await import('@whiskeysockets/baileys');
+        const agg = getAggregateVotesInPollMessage({ message: p.msg.message, pollUpdates: update.pollUpdates }, sock.user?.id);
+        const voters = new Set(agg.flatMap((o) => o.voters || []));
+        for (const v of voters) p.votes.set(v, agg.filter((o) => (o.voters || []).includes(v)).map((o) => o.name));
+      } catch (e) {
+        log('warn', 'poll update failed', { why: String(e?.message || '').slice(0, 60) });
+      }
+    }
+  };
+
   /* ═════════════ SUDO ═════════════ */
   const sudoList = () => (Array.isArray(settings.sudo) ? settings.sudo : []);
   /** true when the sender of this message is a sudo user (treated like the owner). */
@@ -568,8 +683,8 @@ export function createNewCmds({ sock, send, log = () => {}, fetchImpl = globalTh
     ...games.handlers,
     dl,
     delete: del, hidetag, promote: promoteDemote('promote'), demote: promoteDemote('demote'),
-    sudo, delsudo,
+    sudo, delsudo, deploy, sondaj,
     tourl, remini,
   };
-  return { handlers, track, isSudo, gameText: games.onText };
+  return { handlers, track, isSudo, gameText: games.onText, onUpdates };
 }
