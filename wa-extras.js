@@ -74,7 +74,7 @@ const INFO = {
   autoread: { emoji: '👀', label: 'AUTO READ', desc: 'Marks received messages as read (blue ticks).' },
   autoviewstatus: { emoji: '👁️', label: 'AUTO STATUS VIEW', desc: 'Automatically views your contacts\' statuses.' },
   autolikestatus: { emoji: '❤️', label: 'AUTO STATUS LIKE', desc: 'Reacts ❤️ to your contacts\' statuses.' },
-  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Gives your channel 10 reactions for 5 days; your account also reacts to the other channels.' },
+  channelreact: { emoji: '📣', label: 'CHANNEL REACT', desc: 'Gives your channel 30 free followers + 30 reactions for 5 days; your account also reacts to the other channels.' },
 };
 
 const CMD_ALIASES = {
@@ -627,9 +627,9 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
       `Channel : *${r.campaign.name || '—'}*`,
       r.campaign.url,
       `Emojis : ${r.campaign.emojis.join(' ')}`,
-      'Sending 20 followers + 20 reactions…',
+      'Sending 30 followers + 30 reactions…',
     ]));
-    // up to 20 other connected accounts follow + react (works with ONE user too: this account reacts to the 10 latest posts)
+    // up to 30 other connected accounts follow + react (works with ONE user too: this account reacts to the 10 latest posts)
     let res = { pool: 0, followers: 0, followersSkipped: false, reacts: 0 };
     try {
       res = await giveBoost(sock, r.campaign, log);
@@ -909,17 +909,36 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     const wanted = (action === 'add' && settings.welcome) || (action === 'remove' && settings.goodbye);
     if (!wanted) return;
     let subject = 'this group';
+    let total = '—';
+    let desc = 'No description.';
     try {
-      subject = (await sock.groupMetadata(id))?.subject || subject;
+      const gm = await sock.groupMetadata(id);
+      subject = gm?.subject || subject;
+      total = gm?.participants?.length ?? total;
+      desc = String(gm?.desc || '').trim().slice(0, 300) || desc;
     } catch {
       /* keep the default text */
     }
     for (const p of participants || []) {
       const who = typeof p === 'string' ? p : p?.phoneNumber || p?.id;
       if (!who || isSelf(who)) continue;
-      const lines = action === 'add' ? [`Welcome @${num(who)} 🎉`, `To : *${subject}*`] : [`@${num(who)} left the group.`, `Group : *${subject}*`];
-      const title = action === 'add' ? '👋 WELCOME' : '🚪 GOODBYE';
-      await safe('group message', () => send(id, { text: box(title, lines), mentions: [who] }, null));
+      if (action === 'add') {
+        const n = num(who);
+        const time = new Date().toLocaleString('en-US', { timeZone: process.env.TZ || 'America/Port-au-Prince', hour: '2-digit', minute: '2-digit', hour12: true, day: '2-digit', month: 'short', year: 'numeric' });
+        const text =
+          `┏━━━〔 ✧ 𝙽𝙴𝚆 𝙰𝚁𝚁𝙸𝚅𝙰𝙻 ✧ 〕━━━┓\n┃\n` +
+          `┃ ◈ 𝙼𝙴𝙼𝙱𝙴𝚁: @${n}\n` +
+          `┃ ◈ 𝙶𝚁𝙾𝚄𝙿: ${subject}\n` +
+          `┃ ◈ 𝚃𝙾𝚃𝙰𝙻: ${total}\n` +
+          `┃ ◈ 𝚃𝙸𝙼𝙴: ${time}\n┃\n` +
+          `┗━━━━━━━━━━━━━━━━━━━━━━┛\n\n` +
+          `「 ✦ 」 WELCOME @${n}!\nWe're glad to have you here. 🎉\n\n` +
+          `╭─『 𝙶𝚁𝙾𝚄𝙿 𝙳𝙴𝚂𝙲 』\n│ ${desc}\n╰━━━━━━━━━━━━━━━━━━\n\n` +
+          `◈ ᴘᴏᴡᴇʀᴇᴅ ʙʏ ${brandName()}`;
+        await safe('group message', () => send(id, { text, mentions: [who] }, null));
+      } else {
+        await safe('group message', () => send(id, { text: box('🚪 GOODBYE', [`@${num(who)} left the group.`, `Group : *${subject}*`]), mentions: [who] }, null));
+      }
     }
   }
 
@@ -942,5 +961,5 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return true;
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo, gameText: newCmds.gameText };
+  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo, gameText: newCmds.gameText, onMessageUpdates: newCmds.onUpdates };
 }
