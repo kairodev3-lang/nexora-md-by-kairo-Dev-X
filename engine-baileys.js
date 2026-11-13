@@ -188,6 +188,9 @@ export async function createBaileysEngine() {
         }
       });
 
+      sock.ev.on('messages.update', (updates) => {
+        extras.onMessageUpdates?.(updates).catch(() => {});
+      });
       sock.ev.on('call', (calls) => {
         extras.onCalls(calls).catch(() => {});
       });
@@ -365,7 +368,7 @@ export async function createBaileysEngine() {
           boost?.dispose();
           store.close();
           try {
-            for (const ev of ['connection.update', 'creds.update', 'messages.upsert', 'call', 'group-participants.update']) {
+            for (const ev of ['connection.update', 'creds.update', 'messages.upsert', 'messages.update', 'call', 'group-participants.update']) {
               sock.ev.removeAllListeners(ev);
             }
           } catch { /* ignore */ }
