@@ -23,8 +23,8 @@ export const SECTIONS = [
   { icon: '🎮', title: 'GAME', bullet: '⌁', cmds: ['game', 'dungeon', 'tekateki', 'dinorun', 'pinzo', 'pixzo', 'xozo'] },
   { icon: '🤖', title: 'AI', bullet: '⌁', cmds: ['chatgpt', 'gemini', 'aitts'] },
   { icon: '🔎', title: 'SEARCH', bullet: '✧', cmds: ['img', 'bing', 'yts'] },
-  { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall', 'hidetag', 'delete', 'promote', 'demote'] },
-  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'pair', 'depair', 'sudo', 'delsudo'] },
+  { icon: '👥', title: 'GROUP', bullet: '◈', cmds: ['kick', 'kickall', 'tagall', 'hidetag', 'delete', 'promote', 'demote', 'sondaj'] },
+  { icon: '🛠️', title: 'OWNER', bullet: '⌁', cmds: ['getid', 'idch', 'block', 'unblock', 'pair', 'depair', 'sudo', 'delsudo', 'deploy'] },
   {
     icon: '⚙️',
     title: 'SETTINGS',
