@@ -68,6 +68,9 @@ export class SessionManager {
           try { s.handle.close(); } catch { /* already closed */ }
           s.handle = null;
           this._scheduleReconnect(s, 1000);
+        } else if (s.state === 'reconnecting' && !s.reconnectTimer && !s.handle) {
+          this.logger.warn('watchdog: reconnect lost, rescheduling', { tg: s.tgId });
+          this._scheduleReconnect(s, 1000);
         } else if (s.state === 'connecting' && s.stateSince && now - s.stateSince > 120_000) {
           this.logger.warn('watchdog: stuck connecting, retrying', { tg: s.tgId });
           try { s.handle?.close(); } catch { /* ignore */ }
@@ -237,7 +240,7 @@ export class SessionManager {
       case 'forbidden': {
         // A single "500" is very often a temporary WhatsApp hiccup, not a broken session: deleting the session on the
         // first one made the bot go offline for good. Only a repeated failure (3 in 5 minutes) removes the session.
-        if (e.reason === 'bad_session' && s.linked) {
+        if ((e.reason === 'bad_session' || e.reason === 'forbidden') && s.linked) {
           const now = Date.now();
           s.badStrikes = (s.badStrikes || []).filter((t) => now - t < 5 * 60_000);
           s.badStrikes.push(now);
@@ -327,20 +330,33 @@ export class SessionManager {
           if (existing.phone === phone) {
             return { status: 'already_connected', state: existing.state, phone: maskPhone(phone) };
           }
-          throw new ApiError('SESSION_EXISTS', 409, 'You already have a linked number. Use /delete before linking another one.');
-        }
+          // Old session that is not really connected (device removed, WhatsApp dead): replace it instead of blocking.
+          if (existing.state !== 'connected') {
+            await this._remove(existing, { logout: false });
+          } else {
+            throw new ApiError('SESSION_EXISTS', 409, 'You already have a connected number. Use /delete before linking another one.');
+          }
+        } else
         if (Date.now() - existing.pairingAt < RE_PAIR_COOLDOWN_MS) {
           throw new ApiError('TOO_SOON', 429, 'A code was just generated. Wait a few seconds before requesting another.');
         }
         await this._remove(existing); // code précédent abandonné → on repart de zéro
       }
 
-      for (const other of this.sessions.values()) {
+      for (const other of [...this.sessions.values()]) {
         if (other.tgId !== tgId && other.phone === phone) {
-          throw new ApiError('PHONE_IN_USE', 409, 'This number is already linked to another Telegram account.');
+          // Same number on an old / dead session (other Telegram account, .pair from WhatsApp, abandoned code): free it.
+          // Only a session that is really connected keeps the number (otherwise anyone could kick someone else's bot).
+          if (other.state === 'connected') {
+            throw new ApiError('PHONE_IN_USE', 409, 'This number is already connected to the bot (other Telegram account or .pair). Use .depair or /delete on that account first.');
+          }
+          await this._remove(other).catch(() => {});
         }
       }
-      if (this.sessions.size >= this.config.maxSessions) {
+      // Capacity = number of really linked users. Abandoned pairing attempts and half-dead sessions must never
+      // use up a slot (that was making the service say "full" with only 8 users on a limit of 10).
+      await this._purgeStale(tgId);
+      if (this._linkedCount(tgId) >= this.config.maxSessions) {
         throw new ApiError('CAPACITY', 503, 'The service is full right now. Try again later.');
       }
 
@@ -417,11 +433,37 @@ export class SessionManager {
     };
   }
 
+  /** Number of linked sessions (the only ones that count against MAX_SESSIONS), ignoring `exceptTgId`. */
+  _linkedCount(exceptTgId = null) {
+    let n = 0;
+    for (const s of this.sessions.values()) {
+      if (s.tgId !== exceptTgId && s.linked && s.state !== 'removed') n++;
+    }
+    return n;
+  }
+
+  /** Frees the slots held by pairing attempts that were abandoned (never linked, older than the code lifetime). */
+  async _purgeStale(exceptTgId = null) {
+    const now = Date.now();
+    for (const s of [...this.sessions.values()]) {
+      if (s.tgId === exceptTgId || s.linked || s.state === 'removed') continue;
+      if (s.pairingBusy && now - s.pairingAt < 90_000) continue; // a code is being requested right now
+      if (now - s.pairingAt > this.config.pairingTtlMs + 30_000) {
+        await this._remove(s).catch(() => {});
+      }
+    }
+  }
+
   /** Global counters (owner only, exposed through GET /v1/stats). */
   stats() {
     let connected = 0;
     for (const s of this.sessions.values()) if (s.state === 'connected') connected++;
-    return { total_sessions: this.sessions.size, connected_sessions: connected };
+    return {
+      total_sessions: this.sessions.size,
+      connected_sessions: connected,
+      linked_sessions: this._linkedCount(),
+      max_sessions: this.config.maxSessions,
+    };
   }
 
   async disconnect(tgIdRaw) {
