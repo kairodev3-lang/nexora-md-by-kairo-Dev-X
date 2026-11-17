@@ -74,3 +74,20 @@ export class RateLimiter {
     }
   }
 }
+
+/**
+ * Memory used by the process (rss) and the container limit when the host exposes one (Railway, Docker…).
+ * limitMb = 0 means "unknown". `overrideLimitMb` comes from the MEMORY_LIMIT_MB variable.
+ */
+export function memInfo(overrideLimitMb = 0) {
+  const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+  let limitMb = overrideLimitMb || 0;
+  if (!limitMb) {
+    try {
+      const c = process.constrainedMemory?.();
+      // an "unlimited" cgroup reports a huge number (or 0): ignore anything above 64 GB
+      if (Number.isFinite(c) && c > 0 && c < 64 * 1024 ** 3) limitMb = Math.round(c / 1048576);
+    } catch { /* unknown */ }
+  }
+  return { rssMb, limitMb, pct: limitMb ? Math.round((rssMb / limitMb) * 100) : 0 };
+}
