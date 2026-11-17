@@ -11,13 +11,17 @@
 import fs from 'node:fs/promises';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { ApiError, maskPhone, withTimeout, sleep } from './util.js';
+import { ApiError, maskPhone, withTimeout, sleep, memInfo } from './util.js';
 import { deriveKey, sealJson, unsealJson } from './crypto-store.js';
 import { buildMenu, handleWaCommand } from './wa-menu.js';
+import { diskInfo, emergencyCleanup } from './cleanup.js';
 
 const PHONE_RE = /^[1-9]\d{7,14}$/;
 const TG_RE = /^[1-9]\d{0,14}$/;
 const RE_PAIR_COOLDOWN_MS = 20_000;
+const HOUR_MS = 3600_000;
+// A session that WhatsApp keeps answering 500 / 403 is parked (retry every 10 min) and only deleted after this long.
+const GIVE_UP_MS = 12 * HOUR_MS;
 
 export function normalizeTgId(v) {
   const s = String(v ?? '').trim();
@@ -50,6 +54,7 @@ export class SessionManager {
     this.sessions = new Map(); // tgId -> session
     this.locks = new Map();
     this.closing = false;
+    this.lastDisk = null; // refreshed by the disk guard in index.js
     this._startWatchdog();
   }
 
@@ -65,7 +70,7 @@ export class SessionManager {
         if (!s.linked || s.state === 'removed' || s.state === 'pairing') continue;
         if (s.state === 'connected' && s.handle && !s.handle.isAlive()) {
           this.logger.warn('watchdog: socket dead, reconnecting', { tg: s.tgId });
-          try { s.handle.close(); } catch { /* already closed */ }
+          this._closeHandle(s.handle).catch(() => {});
           s.handle = null;
           this._scheduleReconnect(s, 1000);
         } else if (s.state === 'reconnecting' && !s.reconnectTimer && !s.handle) {
@@ -73,7 +78,7 @@ export class SessionManager {
           this._scheduleReconnect(s, 1000);
         } else if (s.state === 'connecting' && s.stateSince && now - s.stateSince > 120_000) {
           this.logger.warn('watchdog: stuck connecting, retrying', { tg: s.tgId });
-          try { s.handle?.close(); } catch { /* ignore */ }
+          this._closeHandle(s.handle).catch(() => {});
           s.handle = null;
           this._scheduleReconnect(s, 1000);
         }
@@ -104,7 +109,9 @@ export class SessionManager {
     return run;
   }
 
+  /** Atomic (temp file + rename): a crash in the middle can no longer leave a half-written meta.enc. */
   async _writeMeta(s) {
+    if (s.state === 'removed') return; // never recreate the folder of a session that was just deleted
     const dir = this.dir(s.tgId);
     await fs.mkdir(dir, { recursive: true, mode: 0o700 });
     const blob = sealJson(this._key(s.tgId), 'meta', {
@@ -112,7 +119,28 @@ export class SessionManager {
       linked: s.linked,
       createdAt: s.createdAt,
     });
-    await fs.writeFile(path.join(dir, 'meta.enc'), blob, { mode: 0o600 });
+    const target = path.join(dir, 'meta.enc');
+    const tmp = `${target}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmp, blob, { mode: 0o600 });
+      if (s.state === 'removed') { await fs.rm(tmp, { force: true }); return; }
+      await fs.rename(tmp, target);
+    } catch (err) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+  }
+
+  /**
+   * Closes a socket AFTER its pending session writes reached the disk (the store drops anything queued once it is
+   * closed, which used to lose the latest keys on every restart / reconnect). Never rejects, never waits > 3 s.
+   */
+  async _closeHandle(h, { flush = true } = {}) {
+    if (!h) return;
+    if (flush) {
+      try { await withTimeout(Promise.resolve(h.flush?.()), 3000, 'flush'); } catch { /* best effort */ }
+    }
+    try { h.close(); } catch { /* already closed */ }
   }
 
   async _readMeta(tgId) {
@@ -171,6 +199,8 @@ export class SessionManager {
     s.state = 'connected';
     s.attempts = 0;
     s.notifiedUnstable = false;
+    s.badStrikes = [];
+    s.failingSince = null;
     s.connectedAt = Date.now();
     clearTimeout(s.pairingTimer);
     s.pairingTimer = null;
@@ -197,7 +227,15 @@ export class SessionManager {
   _onClose(s, e) {
     const old = s.handle;
     s.handle = null;
-    if (e.reason === 'restart_required' && !this.closing && !s.pairingBusy) {
+    if (this.closing || s.pairingBusy) {
+      // shutting down, or connect() is requesting the code and will retry with a new socket by itself
+      this._closeHandle(old, { flush: false }).catch(() => {});
+      return;
+    }
+    const gen = s.gen;
+    const stale = () => s.gen !== gen || s.state === 'removed' || this.closing;
+
+    if (e.reason === 'restart_required') {
       // Normal right after the code is typed: WhatsApp forces a new socket. The new credentials must be fully written
       // to disk BEFORE the old socket is closed and the new one reads them, otherwise the link is lost.
       s.linked = true;
@@ -206,48 +244,50 @@ export class SessionManager {
       s.state = 'connecting';
       this._writeMeta(s).catch(() => {});
       this.logger.info('pairing accepted, reopening socket', { tg: s.tgId });
-      Promise.resolve(old?.flush?.())
-        .catch(() => {})
-        .then(() => { try { old?.close(); } catch { /* already closed */ } })
-        .then(() => this._openHandle(s))
+      this._closeHandle(old)
+        .then(() => { if (!stale()) return this._openHandle(s); })
         .catch((err) => {
           this.logger.warn('reopen after pairing failed', { tg: s.tgId, err: err.message });
-          this._scheduleReconnect(s);
+          if (!stale()) this._scheduleReconnect(s);
         });
       return;
     }
-    try { old?.close(); } catch { /* déjà fermé */ }
-    if (this.closing) return;
-    if (s.pairingBusy) return; // connect() is requesting the code and will retry with a new socket by itself
+
+    // every other close: save what the dead socket still had queued, then decide
+    this._closeHandle(old).then(() => {
+      if (!stale()) this._afterClose(s, e);
+    });
+  }
+
+  _afterClose(s, e) {
     this.logger.info('whatsapp closed the socket', { tg: s.tgId, reason: e.reason, code: e.code, state: s.state, linked: s.linked });
 
     switch (e.reason) {
-      case 'restart_required': {
-        // Normal juste après la saisie du code : WhatsApp impose de rouvrir le socket.
-        s.linked = true;
-        clearTimeout(s.pairingTimer);
-        s.pairingTimer = null;
-        s.state = 'connecting';
-        this._writeMeta(s).catch(() => {});
-        this._openHandle(s).catch((err) => {
-          this.logger.warn('reopen after pairing failed', { tg: s.tgId, err: err.message });
-          this._scheduleReconnect(s);
-        });
-        return;
-      }
       case 'logged_out':
       case 'bad_session':
       case 'forbidden': {
-        // A single "500" is very often a temporary WhatsApp hiccup, not a broken session: deleting the session on the
-        // first one made the bot go offline for good. Only a repeated failure (3 in 5 minutes) removes the session.
-        if ((e.reason === 'bad_session' || e.reason === 'forbidden') && s.linked) {
+        if (s.linked) {
+          // WhatsApp answers 500 / 403 / even 401 by mistake during its own incidents or when many accounts reconnect
+          // at once (after a restart). Deleting a session on the first one is what made people lose their link.
+          //  - 401 (device removed): confirmed by a second 401 15 s later, then the session is deleted
+          //  - 500 / 403: 6 strikes in an hour, then the session is PARKED (retry every 10 min) and only deleted
+          //    after 12 hours of continuous failure
           const now = Date.now();
-          s.badStrikes = (s.badStrikes || []).filter((t) => now - t < 5 * 60_000);
+          s.badStrikes = (s.badStrikes || []).filter((t) => now - t < HOUR_MS);
           s.badStrikes.push(now);
-          if (s.badStrikes.length < 3) {
-            this.logger.warn('bad session code, retrying', { tg: s.tgId, strikes: s.badStrikes.length });
-            this._scheduleReconnect(s);
+          const needed = e.reason === 'logged_out' ? 2 : 6;
+          if (s.badStrikes.length < needed) {
+            this.logger.warn('session closed by whatsapp, retrying before giving up', { tg: s.tgId, reason: e.reason, strikes: s.badStrikes.length });
+            this._scheduleReconnect(s, e.reason === 'logged_out' ? 15_000 : undefined);
             return;
+          }
+          if (e.reason !== 'logged_out') {
+            s.failingSince = s.failingSince || now;
+            if (now - s.failingSince < GIVE_UP_MS) {
+              this.logger.warn('session parked, will retry in 10 min', { tg: s.tgId, reason: e.reason });
+              this._scheduleReconnect(s, 10 * 60_000);
+              return;
+            }
           }
         }
         const wasLinked = s.linked;
@@ -356,9 +396,13 @@ export class SessionManager {
       // Capacity = number of really linked users. Abandoned pairing attempts and half-dead sessions must never
       // use up a slot (that was making the service say "full" with only 8 users on a limit of 10).
       await this._purgeStale(tgId);
-      if (this._linkedCount(tgId) >= this.config.maxSessions) {
-        throw new ApiError('CAPACITY', 503, 'The service is full right now. Try again later.');
+      const linkedNow = this._linkedCount(tgId);
+      if (linkedNow >= this.config.maxSessions) {
+        // the 503 seen by the Telegram bot: this line in the Railway logs tells which limit was hit (MAX_SESSIONS variable)
+        this.logger.warn('refused: MAX_SESSIONS reached', { linked: linkedNow, max: this.config.maxSessions });
+        throw new ApiError('CAPACITY', 503, 'The service is full right now. Try again later.', { linked: linkedNow, max: this.config.maxSessions });
       }
+      await this._checkResources();
 
       const s = {
         tgId,
@@ -454,15 +498,54 @@ export class SessionManager {
     }
   }
 
+  /**
+   * Refuses a NEW link when the server is about to run out of memory or disk. Taking one more session at that point
+   * would get the whole process killed and disconnect everybody (that was the on / off loop of the bot).
+   */
+  async _checkResources() {
+    const limit = this.config.memoryLimitMb || 0;
+    const busyPct = this.config.memoryBusyPct || 95;
+    let mem = memInfo(limit);
+    if (mem.limitMb && mem.pct >= busyPct) {
+      globalThis.gc?.();
+      mem = memInfo(limit);
+      if (mem.pct >= busyPct) {
+        this.logger.warn('refused: memory almost full', mem);
+        throw new ApiError('BUSY', 503, 'The server is under heavy load right now. Try again in a few minutes.', { rss_mb: mem.rssMb, limit_mb: mem.limitMb });
+      }
+    }
+    let disk = await diskInfo(this.config.sessionsDir);
+    if (disk) {
+      this.lastDisk = disk;
+      if (disk.freeMb < 20) {
+        await emergencyCleanup(this.config.sessionsDir, this.logger);
+        disk = await diskInfo(this.config.sessionsDir);
+        if (disk && disk.freeMb < 20) {
+          this.logger.error('refused: disk full', disk);
+          throw new ApiError('DISK_FULL', 503, 'The server storage is full right now. Try again later.', { free_mb: disk.freeMb });
+        }
+      }
+    }
+  }
+
   /** Global counters (owner only, exposed through GET /v1/stats). */
   stats() {
     let connected = 0;
-    for (const s of this.sessions.values()) if (s.state === 'connected') connected++;
+    let reconnecting = 0;
+    for (const s of this.sessions.values()) {
+      if (s.state === 'connected') connected++;
+      else if (s.linked && (s.state === 'reconnecting' || s.state === 'connecting')) reconnecting++;
+    }
+    const mem = memInfo(this.config.memoryLimitMb || 0);
     return {
       total_sessions: this.sessions.size,
       connected_sessions: connected,
+      reconnecting_sessions: reconnecting,
       linked_sessions: this._linkedCount(),
       max_sessions: this.config.maxSessions,
+      rss_mb: mem.rssMb,
+      memory_limit_mb: mem.limitMb,
+      disk: this.lastDisk,
     };
   }
 
@@ -477,27 +560,52 @@ export class SessionManager {
     });
   }
 
-  /** Au démarrage : rouvre toutes les sessions déjà liées, supprime les jumelages inachevés. */
+  /**
+   * At start-up: reopens every session that was linked. NOTHING is deleted unless it is clearly an unfinished pairing:
+   * an unreadable or missing meta.enc is rebuilt from the saved credentials, and a folder that cannot be read at all is
+   * kept on disk (a wrong key or a temporary disk problem must never wipe people's links).
+   */
   async restoreAll({ gapMs = 1500 } = {}) {
     await fs.mkdir(this.config.sessionsDir, { recursive: true, mode: 0o700 });
     const entries = await fs.readdir(this.config.sessionsDir, { withFileTypes: true });
     let restored = 0;
+    let kept = 0;
     for (const ent of entries) {
+      if (this.closing) break;
       if (!ent.isDirectory() || !TG_RE.test(ent.name)) continue;
       const tgId = ent.name;
-      let meta;
+      if (this.sessions.has(tgId)) continue; // a /connect created it while we were restoring
+
+      let meta = null;
       try {
         meta = await this._readMeta(tgId);
       } catch {
         meta = null;
       }
-      if (!meta || !meta.linked || !PHONE_RE.test(String(meta.phone))) {
-        await fs.rm(this.dir(tgId), { recursive: true, force: true });
+      const metaOk = Boolean(meta) && PHONE_RE.test(String(meta.phone));
+      let creds = null;
+      if (!metaOk || !meta.linked) {
+        creds = (await Promise.resolve(this.engine.peekCreds?.({ authDir: this.dir(tgId), key: this._key(tgId) })).catch(() => null)) ?? null;
+      }
+      const phone = metaOk ? String(meta.phone) : creds?.phone && PHONE_RE.test(creds.phone) ? creds.phone : null;
+      const linked = (metaOk && Boolean(meta.linked)) || Boolean(creds?.registered);
+
+      if (!linked || !phone) {
+        const hasCreds = await fs.stat(path.join(this.dir(tgId), 'creds.enc')).then(() => true, () => false);
+        if ((metaOk && !meta.linked && !creds?.registered) || !hasCreds) {
+          // pairing that was never completed (or an empty folder): nothing to keep
+          await fs.rm(this.dir(tgId), { recursive: true, force: true });
+        } else {
+          kept += 1;
+          this.logger.warn('restore: session unreadable, kept on disk untouched', { tg: tgId });
+        }
         continue;
       }
+
+      if (this.sessions.has(tgId)) continue;
       const s = {
         tgId,
-        phone: String(meta.phone),
+        phone,
         state: 'connecting',
         linked: true,
         announced: true,
@@ -505,13 +613,17 @@ export class SessionManager {
         gen: 0,
         attempts: 0,
         notifiedUnstable: false,
-        createdAt: meta.createdAt ?? Date.now(),
+        createdAt: meta?.createdAt ?? Date.now(),
         pairingAt: 0,
         connectedAt: null,
         pairingTimer: null,
         reconnectTimer: null,
       };
       this.sessions.set(tgId, s);
+      if (!metaOk || !meta.linked) {
+        this.logger.warn('restore: meta rebuilt from credentials', { tg: tgId });
+        this._writeMeta(s).catch(() => {});
+      }
       try {
         await this._openHandle(s);
       } catch (err) {
@@ -521,17 +633,21 @@ export class SessionManager {
       restored += 1;
       await sleep(gapMs);
     }
-    this.logger.info('sessions restored', { count: restored });
+    this.logger.info('sessions restored', { count: restored, kept_unreadable: kept });
     return restored;
   }
 
-  /** Arrêt propre : ferme les sockets SANS déconnecter les appareils ni effacer les sessions. */
+  /** Arrêt propre : sauvegarde les écritures en attente, puis ferme les sockets SANS déconnecter les appareils ni effacer les sessions. */
   async shutdown() {
     this.closing = true;
     clearInterval(this._watchdog);
-    for (const s of this.sessions.values()) {
-      this._clearTimers(s);
-      try { s.handle?.close(); } catch { /* ignore */ }
-    }
+    await Promise.all(
+      [...this.sessions.values()].map(async (s) => {
+        this._clearTimers(s);
+        const h = s.handle;
+        s.handle = null;
+        await this._closeHandle(h);
+      }),
+    );
   }
 }
