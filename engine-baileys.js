@@ -7,8 +7,10 @@
 //     logout(): Promise<void>                       // unlinks the device on the WhatsApp side
 //     sendSelf(text): Promise<void>                 // message in the "You" chat
 //     isAlive(): boolean                            // websocket still open?
+//     flush(): Promise<void>                        // waits until every queued write is on the disk
 //     close(): void                                 // closes the socket, blocks any disk write
 //   }
+//   engine.peekCreds({ authDir, key }) -> { registered, phone } | null   // reads the saved credentials (restore after a restart)
 //   onEvent({ type: 'open' })
 //   onEvent({ type: 'close', reason: 'logged_out'|'bad_session'|'forbidden'|'restart_required'|'replaced'|'other', code })
 //
@@ -18,8 +20,9 @@
 
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { useEncryptedAuthState } from './crypto-store.js';
-import { silentBaileysLogger } from './util.js';
+import { useEncryptedAuthState, unsealJson } from './crypto-store.js';
+import { silentBaileysLogger, withTimeout } from './util.js';
+import { emergencyCleanup } from './cleanup.js';
 import { createExtras } from './wa-extras.js';
 import { box, isMenuText } from './wa-menu.js';
 import { attachChannelBoost, channel } from './channelBoost.js';
@@ -112,16 +115,47 @@ export async function createBaileysEngine() {
     };
   };
 
-  return {
-    async open({ authDir, key, onEvent, onCommand, pairing }) {
-      const store = await useEncryptedAuthState(authDir, key, { BufferJSON, initAuthCreds, proto });
+  // WhatsApp web version: looked up once every 6 hours for ALL sessions (it used to be one network call per socket,
+  // with no timeout: after a restart, 20+ sessions waiting on it one after the other made the restore crawl).
+  let versionCache = null; // { version, at }
+  const getVersion = async () => {
+    if (versionCache && Date.now() - versionCache.at < 6 * 3600_000) return versionCache.version;
+    try {
+      const r = await withTimeout(fetchLatestBaileysVersion(), 6000, 'version');
+      if (Array.isArray(r?.version)) versionCache = { version: r.version, at: Date.now() };
+    } catch {
+      if (versionCache) versionCache.at = Date.now() - 5 * 3600_000; // retry in an hour, keep the old one meanwhile
+    }
+    return versionCache?.version; // undefined → the library's default version
+  };
 
-      let version;
+  // one line a few seconds at most when the disk refuses writes (otherwise a full disk would flood the logs)
+  let lastWriteErrLog = 0;
+
+  return {
+    /** Reads the saved credentials without opening a socket: lets the manager rebuild a lost meta file. */
+    async peekCreds({ authDir, key }) {
       try {
-        ({ version } = await fetchLatestBaileysVersion());
+        const blob = await readFile(path.join(authDir, 'creds.enc'));
+        const creds = unsealJson(key, 'creds.enc', blob, BufferJSON.reviver);
+        const phone = String(creds?.me?.id || '').split(':')[0].split('@')[0].replace(/\D/g, '');
+        return { registered: Boolean(creds?.registered || creds?.me?.id), phone: phone || null };
       } catch {
-        /* keep the library's default version */
+        return null;
       }
+    },
+
+    async open({ authDir, key, onEvent, onCommand, pairing }) {
+      const store = await useEncryptedAuthState(authDir, key, { BufferJSON, initAuthCreds, proto }, {
+        onDiskFull: () => emergencyCleanup(path.dirname(authDir), { info: () => {}, error: (m) => log('error', m) }),
+        onError: (file, err) => {
+          if (Date.now() - lastWriteErrLog < 10_000) return;
+          lastWriteErrLog = Date.now();
+          log('error', 'session write failed', { file: String(file).slice(0, 40), code: err?.code, err: String(err?.message || err).slice(0, 80) });
+        },
+      });
+
+      const version = await getVersion();
 
       const sentCache = new Map(); // message id -> message content (for getMessage)
       const sock = makeWASocket({
@@ -148,7 +182,9 @@ export async function createBaileysEngine() {
 
       const send = (jid, content, quoted, plain) => sendMsg(sock, jid, content, quoted, plain, sentCache);
       let boost = null;
-      const extras = await createExtras({
+      let extras;
+      try {
+      extras = await createExtras({
         sock,
         authDir,
         send,
@@ -166,6 +202,13 @@ export async function createBaileysEngine() {
         log,
         stateFile: path.join(authDir, '..', '_channelreact.json'),
       });
+      } catch (err) {
+        // never leave a half-built socket online (it would fight with the next one for the same account)
+        try { boost?.dispose(); } catch { /* ignore */ }
+        try { store.close(); } catch { /* ignore */ }
+        try { sock.end(undefined); } catch { /* ignore */ }
+        throw err;
+      }
 
       let closedWith = null; // status code when WhatsApp closes the socket before the pairing code is issued
       let readyResolve;
@@ -357,7 +400,7 @@ export async function createBaileysEngine() {
           throw lastErr || new Error('pairing failed');
         },
         async flush() {
-          await store.flush?.();
+          await store.flush();
         },
         async logout() {
           await sock.logout();
