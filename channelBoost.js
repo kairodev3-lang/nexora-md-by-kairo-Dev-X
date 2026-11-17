@@ -764,7 +764,9 @@ export function attachChannelBoost(socket, { isEnabled, log = () => {}, stateFil
       disposed = true;
       clearInterval(timer);
       refreshers.delete(refresh);
-      liveSessions.delete(sessionId(socket));
+      // only remove OUR entry: the new socket of the same account may already be registered (reconnect)
+      const cur = liveSessions.get(sessionId(socket));
+      if (!cur || cur.socket === socket) liveSessions.delete(sessionId(socket));
       try {
         socket.ev.off('messages.upsert', onUpsert);
         socket.ev.off('connection.update', onConn);
