@@ -56,7 +56,7 @@ const fileSafe = (name) => {
  * @param {Buffer} key   clé dérivée pour CET utilisateur
  * @param {{BufferJSON:any, initAuthCreds:Function, proto:any}} baileys  helpers Baileys (injectés → testable)
  */
-export async function useEncryptedAuthState(dir, key, { BufferJSON, initAuthCreds, proto }) {
+export async function useEncryptedAuthState(dir, key, { BufferJSON, initAuthCreds, proto }, { onDiskFull, onError } = {}) {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   let closed = false;
   let chain = Promise.resolve();
@@ -67,15 +67,34 @@ export async function useEncryptedAuthState(dir, key, { BufferJSON, initAuthCred
   };
   const file = (name) => `${fileSafe(name)}.enc`;
 
+  const writeOnce = async (f, blob) => {
+    const target = path.join(dir, f);
+    const tmp = `${target}.${crypto.randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmp, blob, { mode: 0o600 });
+      await fs.rename(tmp, target);
+    } catch (e) {
+      await fs.rm(tmp, { force: true }).catch(() => {});
+      throw e;
+    }
+  };
+
   const write = (name, value) =>
     enqueue(async () => {
       if (closed) return;
       const f = file(name);
       const blob = sealJson(key, f, value, BufferJSON.replacer);
-      const target = path.join(dir, f);
-      const tmp = `${target}.${crypto.randomUUID()}.tmp`;
-      await fs.writeFile(tmp, blob, { mode: 0o600 });
-      await fs.rename(tmp, target);
+      try {
+        await writeOnce(f, blob);
+      } catch (e) {
+        // Disk full: free what can be freed (old sender keys, leftovers) and try once more before giving up.
+        if (e?.code === 'ENOSPC' && onDiskFull && !closed) {
+          try { await onDiskFull(); } catch { /* best effort */ }
+          try { await writeOnce(f, blob); return; } catch (e2) { e = e2; }
+        }
+        try { onError?.(f, e); } catch { /* never break the queue */ }
+        throw e;
+      }
     });
 
   const remove = (name) =>
@@ -135,6 +154,8 @@ export async function useEncryptedAuthState(dir, key, { BufferJSON, initAuthCred
   return {
     state,
     saveCreds: () => write('creds', creds),
+    /** Resolves when every write queued so far has reached the disk. Never rejects. */
+    flush: () => chain.then(() => undefined, () => undefined),
     /** Plus aucune écriture ne sera acceptée (appelé avant de supprimer le dossier). */
     close: () => {
       closed = true;
