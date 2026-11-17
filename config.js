@@ -32,6 +32,9 @@ export function loadConfig(env = process.env) {
       ownerWa: env.OWNER_WA || 'https://wa.me/50939360237',
     },
     maxSessions: int(env.MAX_SESSIONS, 200),
+    // memory guard: MEMORY_LIMIT_MB overrides the limit detected from the container; new links are refused above MEMORY_BUSY_PCT %
+    memoryLimitMb: int(env.MEMORY_LIMIT_MB, 0),
+    memoryBusyPct: int(env.MEMORY_BUSY_PCT, 95),
     pairingTtlMs: int(env.PAIRING_TTL_SEC, 180) * 1000,
   };
 }
