@@ -35,6 +35,7 @@ export function loadConfig(env = process.env) {
     // memory guard: MEMORY_LIMIT_MB overrides the limit detected from the container; new links are refused above MEMORY_BUSY_PCT %
     memoryLimitMb: int(env.MEMORY_LIMIT_MB, 0),
     memoryBusyPct: int(env.MEMORY_BUSY_PCT, 95),
+    reserveMb: int(env.RESERVE_MB, 30), // disk kept aside, released when the volume is full (0 = no reserve)
     pairingTtlMs: int(env.PAIRING_TTL_SEC, 180) * 1000,
   };
 }
