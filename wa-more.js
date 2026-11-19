@@ -360,19 +360,88 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
   }
 
   /* ───────── .viewonce (.vv) / .vv2 ───────── */
+  // WhatsApp no longer always keeps the media keys of a view-once message when it is QUOTED, so the bot also keeps the
+  // original message the moment it arrives (metadata only, a few KB each) and downloads from that copy when asked.
+  const voCache = new Map(); // message id -> { key, message, at }
+  const VO_MAX = 600;
+  const VO_TTL = 36 * 3600 * 1000;
+  const unwrapAll = (msg) => {
+    let cur = msg;
+    for (let i = 0; i < 8 && cur; i++) {
+      const inner = cur.viewOnceMessageV2?.message || cur.viewOnceMessageV2Extension?.message || cur.viewOnceMessage?.message
+        || cur.ephemeralMessage?.message || cur.documentWithCaptionMessage?.message || cur.editedMessage?.message;
+      if (!inner) break;
+      cur = inner;
+    }
+    return cur || null;
+  };
+  const mediaOf = (c) => {
+    for (const k of ['image', 'video', 'audio']) if (c?.[`${k}Message`]) return [k, c[`${k}Message`]];
+    return null;
+  };
+  /** Called for EVERY incoming message (see engine): keeps view-once media so .vv can still read it later. */
+  function rememberViewOnce(m) {
+    try {
+      const raw = m?.message;
+      if (!raw || !m.key?.id) return;
+      const flagged = raw.viewOnceMessageV2 || raw.viewOnceMessage || raw.viewOnceMessageV2Extension
+        || raw.ephemeralMessage?.message?.viewOnceMessageV2 || raw.ephemeralMessage?.message?.viewOnceMessage;
+      const inner = unwrapAll(raw);
+      const hit = mediaOf(inner);
+      if (!hit || !(flagged || hit[1].viewOnce)) return;
+      voCache.set(m.key.id, { key: m.key, message: inner, at: Date.now() });
+      if (voCache.size > VO_MAX) {
+        const now = Date.now();
+        for (const [id, v] of voCache) if (now - v.at > VO_TTL) voCache.delete(id);
+        while (voCache.size > VO_MAX) voCache.delete(voCache.keys().next().value);
+      }
+    } catch { /* never block a message */ }
+  }
+
   async function viewonce(toDm, { jid, m, content, reply }) {
-    const ci = content?.extendedTextMessage?.contextInfo;
+    const root = unwrapAll(content) || content;
+    const ci = root?.extendedTextMessage?.contextInfo || root?.imageMessage?.contextInfo || root?.videoMessage?.contextInfo;
     if (!ci?.quotedMessage) return reply(box('👁️ VIEW ONCE', [`Reply to a media with *${P()}${toDm ? 'vv2' : 'vv'}*`, toDm ? 'The media is sent to your DM.' : 'The media is sent back here.']));
-    const found = findMedia({ jid, m, content: { extendedTextMessage: { contextInfo: ci } } }, ['image', 'video', 'audio']);
-    if (!found) return reply(box('❌ VIEW ONCE', ['No photo, video or audio in that message.']));
-    if (toNum(found.node.fileLength) > MAX_DOWNLOAD_BYTES) return reply(box('❌ VIEW ONCE', ['Media too big (max 64 MB).']));
+
+    const cached = ci.stanzaId ? voCache.get(ci.stanzaId) : null;
+    const quoted = unwrapAll(ci.quotedMessage);
+    const hit = mediaOf(cached?.message) || mediaOf(quoted);
+    if (!hit) return reply(box('❌ VIEW ONCE', ['No photo, video or audio in that message.']));
+    if (toNum(hit[1].fileLength) > MAX_DOWNLOAD_BYTES) return reply(box('❌ VIEW ONCE', ['Media too big (max 64 MB).']));
     react(jid, m, '⏳');
-    const buf = await dl(found.msgLike);
+
+    // 1) the copy kept when the message arrived, 2) the quoted copy
+    const sources = [];
+    if (cached) sources.push(cached);
+    sources.push({ key: { remoteJid: jid, id: ci.stanzaId, participant: ci.participant, fromMe: false }, message: quoted });
+    let buf = null;
+    let lastErr = '';
+    for (const src of sources) {
+      const h = mediaOf(src.message);
+      if (!h) continue;
+      try {
+        buf = await dl({ key: src.key, message: src.message });
+        if (buf?.length) break;
+      } catch (e) {
+        lastErr = String(e?.message || e).slice(0, 80);
+        log('warn', 'viewonce download failed', { err: lastErr, cached: src === cached });
+      }
+    }
+    if (!buf?.length) {
+      react(jid, m, '❌');
+      return reply(box('❌ VIEW ONCE', [
+        'Could not download this media.',
+        cached ? 'It may have expired on WhatsApp servers.' : 'The bot did not receive this message when it was sent (or it was already opened on the phone).',
+        'Tip : reply to a NEW view-once media while the bot is online.',
+        ...(lastErr ? [`Reason : ${lastErr}`] : []),
+      ]));
+    }
+    const [kind, node] = hit;
     const cap = box('👁️ VIEW ONCE', ['Media recovered ✅', `Bot : *${brand().bot}*`]);
     const payload =
-      found.kind === 'image' ? { image: buf, caption: cap }
-        : found.kind === 'video' ? { video: buf, caption: cap, mimetype: 'video/mp4' }
-          : { audio: buf, mimetype: found.node.mimetype || 'audio/mpeg', ptt: Boolean(found.node.ptt) };
+      kind === 'image' ? { image: buf, caption: cap }
+        : kind === 'video' ? { video: buf, caption: cap, mimetype: 'video/mp4' }
+          : { audio: buf, mimetype: node.mimetype || 'audio/mpeg', ptt: Boolean(node.ptt) };
     const target = toDm ? ownJid() : jid;
     if (!target) return reply(box('❌ VIEW ONCE', ['Bot number not found.']));
     await send(target, payload, toDm ? null : m, true);
@@ -446,5 +515,7 @@ export function createMore({ sock, send, log, helpers, fetchImpl, P, ownJid, set
     twitter: (c) => twitter(c.q, c),
     viewonce: (c) => viewonce(false, c),
     vv2: (c) => viewonce(true, c),
+    // not a command: used by the engine to keep view-once media (see rememberViewOnce)
+    _rememberViewOnce: rememberViewOnce,
   };
 }
