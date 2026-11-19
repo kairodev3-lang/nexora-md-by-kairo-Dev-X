@@ -962,5 +962,5 @@ export async function createExtras({ sock, authDir, send, helpers, log = () => {
     return true;
   }
 
-  return { settings, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo, gameText: newCmds.gameText, onMessageUpdates: newCmds.onUpdates };
+  return { settings, rememberViewOnce: more._rememberViewOnce, has: (cmd) => COMMANDS.has(cmd), guestCheck, boostLink, playChoice, handleCommand, saveFromStatus, onIncoming, onCalls, onGroupUpdate, isSudo: newCmds.isSudo, gameText: newCmds.gameText, onMessageUpdates: newCmds.onUpdates };
 }
