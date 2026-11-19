@@ -257,6 +257,7 @@ export async function createBaileysEngine() {
               if (!m.key?.fromMe && m.messageStubType) log('warn', 'wa message not decrypted', { stub: m.messageStubType, dm: !String(m.key?.remoteJid || '').endsWith('@g.us') });
               continue;
             }
+            extras.rememberViewOnce?.(m); // keeps view-once media so .vv / .vv2 can read it later
             // the owner (message written by the account itself) and the sudo users have full access
             const isOwner = Boolean(m.key?.fromMe) || (type === 'notify' && Boolean(extras.isSudo?.(m)));
             if (!isOwner) {
